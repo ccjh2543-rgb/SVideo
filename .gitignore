@@ -13,8 +13,10 @@ backend/configs/config.yaml
 backend/configs/config.compose-local.yaml
 backend/configs/config.docker.yaml
 
-# 个人简历包含手机号和邮箱，不进入公开仓库
-面试问题/简历.md
+# 面试资料与项目解析仅保留本地，不进入公开仓库
+面试问题/
+项目解析/
+项目解析.md
 
 # 编辑器/Agent 本地元数据
 .trae/
