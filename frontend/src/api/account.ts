@@ -21,7 +21,7 @@ export function logout(refreshToken: string) {
   return postJson<MessageResponse>(
     '/account/logout',
     { refresh_token: refreshToken },
-    { authRequired: true, skipRefresh: true },
+    { authRequired: true },
   )
 }
 
@@ -33,7 +33,7 @@ export function changePassword(oldPassword: string, newPassword: string) {
   return postJson<MessageResponse>(
     '/account/changePassword',
     { old_password: oldPassword, new_password: newPassword },
-    { authRequired: true, skipRefresh: true },
+    { authRequired: true },
   )
 }
 
