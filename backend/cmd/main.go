@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	appaccount "feedsystem_video_go/internal/application/account"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
 	apphttp "feedsystem_video_go/internal/http"
+	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	"feedsystem_video_go/internal/infrastructure/security"
 	rabbitmq "feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/observability"
@@ -87,8 +90,22 @@ func main() {
 	}
 	defer pprofServer.Close()
 
+	// 组合根：构造账号领域依赖
+	tokens, err := security.NewJWTServiceFromEnv()
+	if err != nil {
+		log.Fatalf("Failed to initialize JWT service: %v", err)
+	}
+	accountRepository := accountmysql.NewAccountRepository(sqlDB)
+	refreshTokenRepository := accountmysql.NewRefreshTokenRepository(sqlDB)
+	accountApp := appaccount.NewService(
+		accountRepository,
+		refreshTokenRepository,
+		tokens,
+		security.NewBcryptHasher(),
+	)
+
 	// 设置路由
-	r := apphttp.SetRouter(sqlDB, cache, rmq)
+	r := apphttp.SetRouter(sqlDB, cache, rmq, accountApp, tokens)
 	log.Printf("Server is running on port %d", cfg.Server.Port)
 	if err := r.Run(":" + strconv.Itoa(cfg.Server.Port)); err != nil {
 		log.Fatalf("Failed to run server: %v", err)

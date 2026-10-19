@@ -119,4 +119,3 @@ func (w *CommentWorker) applyDelete(ctx context.Context, evt *rabbitmq.CommentEv
 	}
 	return w.comments.DeleteComment(ctx, c)
 }
-

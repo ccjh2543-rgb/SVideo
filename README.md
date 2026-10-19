@@ -22,6 +22,55 @@ cp backend/configs/config.example.yaml backend/configs/config.yaml
 
 后端进程会读取同名环境变量并覆盖 YAML 中的值。`JWT_SECRET` 必须设置，否则登录和鉴权会直接报错。
 
+## 认证接口示例
+
+登录返回 Access Token（15 分钟）和 Refresh Token（7 天）：
+
+```bash
+curl -X POST http://localhost:8080/account/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"password"}'
+```
+
+响应：
+
+```json
+{
+  "token": "<access_token>",
+  "access_token": "<access_token>",
+  "refresh_token": "<refresh_token>",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_expires_in": 604800
+}
+```
+
+刷新 Token（每次刷新都会轮换，旧 Refresh Token 立即失效）：
+
+```bash
+curl -X POST http://localhost:8080/account/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<refresh_token>"}'
+```
+
+调用受保护接口：
+
+```bash
+curl -X POST http://localhost:8080/video/publish \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"demo","play_url":"http://example.com/a.mp4","cover_url":"http://example.com/a.jpg"}'
+```
+
+登出会撤销当前 Refresh Token 所属的整个登录会话：
+
+```bash
+curl -X POST http://localhost:8080/account/logout \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<refresh_token>"}'
+```
+
 ## Docker Compose 一键启动（推荐）
 
 要求：已安装 Docker Desktop / Docker Engine + Docker Compose。

@@ -9,6 +9,50 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
+func TestTakeTokenConsumesAndRefills(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis: %v", err)
+	}
+	defer mr.Close()
+
+	client := &Client{
+		rdb: goredis.NewClient(&goredis.Options{Addr: mr.Addr()}),
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "feedsystem:ratelimit:tokenbucket:test"
+
+	// 容量 2，补充速率 100/s：先耗尽，再等待 30ms 让令牌恢复。
+	for i := 0; i < 2; i++ {
+		allowed, _, err := client.TakeToken(ctx, key, 2, 100, time.Minute)
+		if err != nil {
+			t.Fatalf("take token %d: %v", i, err)
+		}
+		if !allowed {
+			t.Fatalf("expected token %d to be allowed", i)
+		}
+	}
+
+	allowed, _, err := client.TakeToken(ctx, key, 2, 100, time.Minute)
+	if err != nil {
+		t.Fatalf("take token after exhaustion: %v", err)
+	}
+	if allowed {
+		t.Fatal("expected token bucket to be exhausted")
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	allowed, _, err = client.TakeToken(ctx, key, 2, 100, time.Minute)
+	if err != nil {
+		t.Fatalf("take token after refill: %v", err)
+	}
+	if !allowed {
+		t.Fatal("expected token bucket to refill")
+	}
+}
+
 func TestIncrementWithExpireSetsTTLWithoutExtendingWindow(t *testing.T) {
 	mr, err := miniredis.Run()
 	if err != nil {

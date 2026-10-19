@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"feedsystem_video_go/internal/util"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/social"
+	"feedsystem_video_go/internal/util"
 	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"

@@ -3,43 +3,73 @@ import { computed, ref } from 'vue'
 
 import { decodeJwtPayload, type JwtPayload } from '../utils/jwt'
 
-const TOKEN_KEY = 'jwt_token'
+const ACCESS_KEY = 'access_token'
+const REFRESH_KEY = 'refresh_token'
+const LEGACY_KEY = 'jwt_token'
 
-function readToken(): string | null {
+function readStorage(key: string): string | null {
   try {
-    return localStorage.getItem(TOKEN_KEY)
+    return localStorage.getItem(key)
   } catch {
     return null
   }
 }
 
-function writeToken(token: string) {
-  localStorage.setItem(TOKEN_KEY, token)
+function writeStorage(key: string, value: string) {
+  localStorage.setItem(key, value)
 }
 
-function removeToken() {
-  localStorage.removeItem(TOKEN_KEY)
+function removeStorage(key: string) {
+  localStorage.removeItem(key)
 }
 
 export const useAuthStore = defineStore('auth', () => {
-  const token = ref<string | null>(readToken())
+  const accessToken = ref<string | null>(readStorage(ACCESS_KEY) || readStorage(LEGACY_KEY))
+  const refreshToken = ref<string | null>(readStorage(REFRESH_KEY))
 
-  const isLoggedIn = computed(() => !!token.value)
-  const claims = computed<JwtPayload | null>(() => (token.value ? decodeJwtPayload(token.value) : null))
+  const token = computed(() => accessToken.value)
+  const isLoggedIn = computed(() => !!accessToken.value)
+  const claims = computed<JwtPayload | null>(() => (accessToken.value ? decodeJwtPayload(accessToken.value) : null))
 
+  // setTokens 同时保存 Access Token 和 Refresh Token。
+  // 旧键 jwt_token 继续写入，兼容尚未迁移的页面和脚本。
+  function setTokens(access: string, refresh?: string | null) {
+    accessToken.value = access
+    writeStorage(ACCESS_KEY, access)
+    writeStorage(LEGACY_KEY, access)
+    if (refresh) {
+      refreshToken.value = refresh
+      writeStorage(REFRESH_KEY, refresh)
+    }
+  }
+
+  // setToken 保留旧调用方式，只更新 Access Token。
   function setToken(newToken: string) {
-    token.value = newToken
-    writeToken(newToken)
+    setTokens(newToken, refreshToken.value)
   }
 
   function clearToken() {
-    token.value = null
-    removeToken()
+    accessToken.value = null
+    refreshToken.value = null
+    removeStorage(ACCESS_KEY)
+    removeStorage(REFRESH_KEY)
+    removeStorage(LEGACY_KEY)
   }
 
   function syncFromStorage() {
-    token.value = readToken()
+    accessToken.value = readStorage(ACCESS_KEY) || readStorage(LEGACY_KEY)
+    refreshToken.value = readStorage(REFRESH_KEY)
   }
 
-  return { token, isLoggedIn, claims, setToken, clearToken, syncFromStorage }
+  return {
+    token,
+    accessToken,
+    refreshToken,
+    isLoggedIn,
+    claims,
+    setToken,
+    setTokens,
+    clearToken,
+    syncFromStorage,
+  }
 })

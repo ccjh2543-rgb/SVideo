@@ -1,0 +1,18 @@
+.git
+.github
+.trae
+data
+.run
+backend/.run
+.env
+.env.*
+!.env.example
+
+# 真实配置和密钥不进入镜像，容器通过挂载 config.example.yaml + 环境变量运行
+backend/configs/config.yaml
+backend/configs/config.compose-local.yaml
+backend/configs/config.docker.yaml
+
+frontend/node_modules
+frontend/dist
+**/*.log

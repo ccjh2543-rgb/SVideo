@@ -44,7 +44,7 @@ async function submitRename() {
   busy.value = true
   try {
     const res = await accountApi.rename(newUsername)
-    auth.setToken(res.token)
+    auth.setTokens(res.access_token || res.token, res.refresh_token)
     rename.open = false
     toast.success('改名成功（已刷新 token）')
   } catch (e) {
@@ -70,7 +70,7 @@ async function onLogout() {
 
   busy.value = true
   try {
-    await accountApi.logout()
+    await accountApi.logout(auth.refreshToken || '')
   } catch (e) {
     const msg = e instanceof ApiError ? e.message : String(e)
     toast.error(`登出失败：${msg}`)

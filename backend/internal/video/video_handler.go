@@ -1,10 +1,10 @@
 package video
 
 import (
-	"fmt"
 	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/middleware/jwt"
 	"feedsystem_video_go/internal/util"
+	"fmt"
 	"net/http"
 	"os"
 	"path"
