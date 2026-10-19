@@ -1,0 +1,29 @@
+# 配置模板：复制为 config.yaml 后按本机环境修改。
+# 所有密码类字段都可以通过环境变量覆盖，生产环境不要明文写入仓库。
+server:
+  port: 8080
+
+database:
+  host: localhost
+  port: 3306
+  user: root
+  password: "CHANGE_ME"
+  dbname: feedsystem
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 3
+
+rabbitmq:
+  host: localhost
+  port: 5672
+  username: guest
+  password: "CHANGE_ME"
+
+observability:
+  pprof:
+    enabled: true
+    api_addr: localhost:6060
+    worker_addr: localhost:6061

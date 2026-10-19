@@ -1,0 +1,66 @@
+.run/
+backend/.run/
+backend/.run/uploads/
+
+# 中间件运行数据（RabbitMQ mnesia 中包含 cookie，禁止提交）
+data/
+
+# 本地真实配置与密钥，仓库只保留 example
+.env
+.env.*
+!.env.example
+backend/configs/config.yaml
+backend/configs/config.compose-local.yaml
+backend/configs/config.docker.yaml
+
+# 个人简历包含手机号和邮箱，不进入公开仓库
+面试问题/简历.md
+
+# 编辑器/Agent 本地元数据
+.trae/
+
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+.idea/
+.vscode/
+
+# 前端依赖与构建产物
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# 日志与测试产物
+*.log
+coverage.*
+*.coverprofile
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
