@@ -1,4 +1,4 @@
-package worker
+package feed
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 
 	feedapp "feedsystem_video_go/internal/application/feed"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/workers"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -17,12 +18,12 @@ import (
 type FanoutWorker struct {
 	ch      *amqp.Channel
 	service *feedapp.FanoutService
-	events  EventIdempotency
+	events  workers.EventIdempotency
 	queue   string
 }
 
 // NewFanoutWorker 创建写扩散 Worker。
-func NewFanoutWorker(ch *amqp.Channel, service *feedapp.FanoutService, events EventIdempotency, queue string) *FanoutWorker {
+func NewFanoutWorker(ch *amqp.Channel, service *feedapp.FanoutService, events workers.EventIdempotency, queue string) *FanoutWorker {
 	return &FanoutWorker{ch: ch, service: service, events: events, queue: queue}
 }
 

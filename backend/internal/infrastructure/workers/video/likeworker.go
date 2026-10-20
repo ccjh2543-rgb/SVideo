@@ -1,4 +1,4 @@
-package worker
+package video
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	domainnotification "feedsystem_video_go/internal/domain/notification"
 	domainvideo "feedsystem_video_go/internal/domain/video"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/workers"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
 	"time"
@@ -16,7 +17,7 @@ type LikeWorker struct {
 	ch       *amqp.Channel
 	likes    domainvideo.LikeRepository
 	videos   domainvideo.VideoRepository
-	events   EventIdempotency
+	events   workers.EventIdempotency
 	notifier domainnotification.Notifier
 	queue    string
 }
@@ -25,7 +26,7 @@ func NewLikeWorker(
 	ch *amqp.Channel,
 	likes domainvideo.LikeRepository,
 	videos domainvideo.VideoRepository,
-	events EventIdempotency,
+	events workers.EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
 ) *LikeWorker {

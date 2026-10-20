@@ -24,13 +24,13 @@ import (
 	socialmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/social"
 	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/infrastructure/security"
+	feedworkers "feedsystem_video_go/internal/infrastructure/workers/feed"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
 	httpfeed "feedsystem_video_go/internal/interfaces/http/feed"
 	httpsocial "feedsystem_video_go/internal/interfaces/http/social"
 	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
-	"feedsystem_video_go/internal/worker"
 )
 
 // 加载配置
@@ -217,8 +217,8 @@ func main() {
 		timelineMQ = nil
 	}
 	if timelineMQ != nil {
-		worker.StartOutboxPoller(videomysql.NewOutboxRepository(sqlDB), timelineMQ)
-		worker.StartConsumer(timelineMQ, rabbitmq.TimelineQueueName, cache)
+		feedworkers.StartOutboxPoller(videomysql.NewOutboxRepository(sqlDB), timelineMQ)
+		feedworkers.StartConsumer(timelineMQ, rabbitmq.TimelineQueueName, cache)
 	}
 
 	// ============================================================

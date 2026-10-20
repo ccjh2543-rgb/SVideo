@@ -1,4 +1,5 @@
-package worker
+// Package workers 提供消费者 Worker 的共享能力。
+package workers
 
 import "context"
 

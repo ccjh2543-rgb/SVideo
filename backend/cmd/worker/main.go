@@ -10,9 +10,11 @@ import (
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
 	socialmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/social"
 	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
+	feedworkers "feedsystem_video_go/internal/infrastructure/workers/feed"
+	socialworkers "feedsystem_video_go/internal/infrastructure/workers/social"
+	videoworkers "feedsystem_video_go/internal/infrastructure/workers/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
-	"feedsystem_video_go/internal/worker"
 	"log"
 	"os"
 	"os/signal"
@@ -182,22 +184,22 @@ func main() {
 	// 6. 创建具体的 Worker（消费者）
 	// ============================================================
 	// Worker 负责从指定队列消费消息，并调用相应的业务逻辑处理
-	var socialWorker *worker.SocialWorker
-	var likeWorker *worker.LikeWorker
-	var commentWorker *worker.CommentWorker
-	var popularityWorker *worker.PopularityWorker
-	var fanoutWorker *worker.FanoutWorker
+	var socialWorker *socialworkers.SocialWorker
+	var likeWorker *videoworkers.LikeWorker
+	var commentWorker *videoworkers.CommentWorker
+	var popularityWorker *videoworkers.PopularityWorker
+	var fanoutWorker *feedworkers.FanoutWorker
 
 	// 只有当 RabbitMQ 通道（ch）不为 nil 时，才创建工作线程
 	// 队列名称（如 socialQueue）应当是在其他地方定义的常量，代表需要监听的队列名
 	if ch != nil {
-		socialWorker = worker.NewSocialWorker(ch, repo, creatorRepo, processedEvents, notifier, socialQueue)
-		likeWorker = worker.NewLikeWorker(ch, likeRepo, videoRepo, processedEvents, notifier, likeQueue)
-		commentWorker = worker.NewCommentWorker(ch, commentRepo, videoRepo, processedEvents, notifier, commentQueue)
+		socialWorker = socialworkers.NewSocialWorker(ch, repo, creatorRepo, processedEvents, notifier, socialQueue)
+		likeWorker = videoworkers.NewLikeWorker(ch, likeRepo, videoRepo, processedEvents, notifier, likeQueue)
+		commentWorker = videoworkers.NewCommentWorker(ch, commentRepo, videoRepo, processedEvents, notifier, commentQueue)
 
 		// PopularityWorker 仅在 Redis 客户端也有效时才创建
 		if cache != nil {
-			popularityWorker = worker.NewPopularityWorker(ch, cache, processedEvents, popularityQueue)
+			popularityWorker = videoworkers.NewPopularityWorker(ch, cache, processedEvents, popularityQueue)
 		}
 
 		// 写扩散依赖 Redis，Redis 不可用时跳过。
@@ -206,7 +208,7 @@ func main() {
 			if _, err := rabbitmq.NewFanoutMQ(baseRMQ); err != nil {
 				log.Printf("Failed to declare fanout topology: %v", err)
 			} else {
-				fanoutWorker = worker.NewFanoutWorker(ch, fanoutService, processedEvents, rabbitmq.FanoutQueueName)
+				fanoutWorker = feedworkers.NewFanoutWorker(ch, fanoutService, processedEvents, rabbitmq.FanoutQueueName)
 			}
 		}
 	}

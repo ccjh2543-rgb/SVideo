@@ -1,4 +1,4 @@
-package worker
+package video
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	domainnotification "feedsystem_video_go/internal/domain/notification"
 	domainvideo "feedsystem_video_go/internal/domain/video"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/workers"
 	"log"
 	"strings"
 
@@ -17,7 +18,7 @@ type CommentWorker struct {
 	ch       *amqp.Channel
 	comments domainvideo.CommentRepository
 	videos   domainvideo.VideoRepository
-	events   EventIdempotency
+	events   workers.EventIdempotency
 	notifier domainnotification.Notifier
 	queue    string
 }
@@ -26,7 +27,7 @@ func NewCommentWorker(
 	ch *amqp.Channel,
 	comments domainvideo.CommentRepository,
 	videos domainvideo.VideoRepository,
-	events EventIdempotency,
+	events workers.EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
 ) *CommentWorker {

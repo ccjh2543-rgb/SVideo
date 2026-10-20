@@ -1,4 +1,4 @@
-package worker
+package video
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	videocache "feedsystem_video_go/internal/infrastructure/cache/redis/video"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/workers"
 	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -16,11 +17,11 @@ type PopularityWorker struct {
 	ch      *amqp.Channel
 	cache   *rediscache.Client
 	updater *videocache.PopularityCache
-	events  EventIdempotency
+	events  workers.EventIdempotency
 	queue   string
 }
 
-func NewPopularityWorker(ch *amqp.Channel, cache *rediscache.Client, events EventIdempotency, queue string) *PopularityWorker {
+func NewPopularityWorker(ch *amqp.Channel, cache *rediscache.Client, events workers.EventIdempotency, queue string) *PopularityWorker {
 	return &PopularityWorker{
 		ch:      ch,
 		cache:   cache,

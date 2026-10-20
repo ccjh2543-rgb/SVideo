@@ -1,4 +1,4 @@
-package worker
+package social
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	domainnotification "feedsystem_video_go/internal/domain/notification"
 	domainsocial "feedsystem_video_go/internal/domain/social"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/workers"
 	"feedsystem_video_go/internal/util"
 	"log"
 
@@ -19,7 +20,7 @@ type SocialWorker struct {
 	ch       *amqp.Channel
 	repo     domainsocial.Repository
 	creators domainsocial.StatsRepository
-	events   EventIdempotency
+	events   workers.EventIdempotency
 	notifier domainnotification.Notifier
 	queue    string
 }
@@ -29,7 +30,7 @@ func NewSocialWorker(
 	ch *amqp.Channel,
 	repo domainsocial.Repository,
 	creators domainsocial.StatsRepository,
-	events EventIdempotency,
+	events workers.EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
 ) *SocialWorker {
