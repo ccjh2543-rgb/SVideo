@@ -5,6 +5,20 @@
 详细设计与接口说明请阅读：`feedsystem_video_go项目设计.md`（包含模块设计、表结构、流程图与接口清单）。
 ## [项目演示](https://www.bilibili.com/video/BV1Dti7B9E6Y?vd_source=4b2884373b2c4c4147b10162c1709276)
 
+## 代码结构（DDD 分层）
+
+```text
+backend/internal/
+├── domain/          # 领域层：实体、值对象、领域错误、仓储接口
+├── application/     # 应用层：用例编排（账号、视频、Feed、社交）
+├── infrastructure/  # 基础设施层：MySQL、Redis、RabbitMQ、Worker
+├── interfaces/      # 接口层：HTTP Handler、DTO、中间件、WebSocket
+└── http/            # 路由装配，只注册路由与中间件
+```
+
+依赖方向为 `interfaces → application → domain`，`infrastructure` 负责实现 `domain/application` 定义的接口。
+`internal/architecture` 与 `internal/http` 中的测试会校验分层依赖和路由快照。
+
 ## 环境变量与配置
 
 仓库只提交配置模板，真实密码和密钥通过环境变量注入：
@@ -86,7 +100,7 @@ docker compose up -d --build
 
 说明：
 - Compose 会启动 `mysql`、`redis`、`rabbitmq`、`backend`（API）、`worker`、`frontend`。
-- 容器内后端配置使用 `backend/configs/config.docker.yaml`（会挂载到 `/app/configs/config.yaml`）。
+- 容器内后端配置使用 `backend/configs/config.example.yaml`（会挂载到 `/app/configs/config.yaml`）。
 
 ## 本地开发启动（不容器化）
 1) 先启动依赖（也可以只用 compose 拉起依赖）：
@@ -94,18 +108,18 @@ docker compose up -d --build
 docker compose up -d mysql redis rabbitmq
 ```
 
-1) 用 compose 启 MySQL 时，宿主机端口是 `3307`。本地 Go 进程请使用面向 compose 依赖的配置文件 `backend/configs/config.compose-local.yaml`。
+1) 用 compose 启 MySQL 时，宿主机端口是 `3308`。本地 Go 进程请使用面向 compose 依赖的配置（复制 `backend/configs/config.example.yaml` 后按需调整端口）。
 
 2) 启动后端 API：
 ```bash
 cd backend
-CONFIG_PATH=configs/config.compose-local.yaml go run ./cmd
+CONFIG_PATH=configs/config.yaml go run ./cmd
 ```
 
 1) 启动 Worker（消费 MQ、异步落库/更新 Redis 热榜）：
 ```bash
 cd backend
-CONFIG_PATH=configs/config.compose-local.yaml go run ./cmd/worker
+CONFIG_PATH=configs/config.yaml go run ./cmd/worker
 ```
 
 1) 启动前端（开发模式）：
@@ -243,10 +257,10 @@ go run ./cmd/worker
 
 ✅ 启动成功你会看到：
 ```
-Worker started, consuming queue=social.events
-Worker started, consuming queue=like.events
-Worker started, consuming queue=comment.events
-Worker started, consuming queue=video.popularity.events
+Worker started, consuming queue=social.events.v2
+Worker started, consuming queue=like.events.v2
+Worker started, consuming queue=comment.events.v2
+Worker started, consuming queue=video.popularity.events.v2
 ```
 
 ---
