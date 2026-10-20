@@ -13,8 +13,10 @@ type LikeMQ struct {
 
 const (
 	likeExchange   = "like.events"
-	likeQueue      = "like.events"
+	LikeQueueName  = "like.events.v2"
 	likeBindingKey = "like.*"
+	likeDLX        = "like.events.dlx"
+	LikeDLQName    = "like.events.dlq"
 
 	likeLikeRK   = "like.like"
 	likeUnlikeRK = "like.unlike"
@@ -32,7 +34,7 @@ func NewLikeMQ(base *RabbitMQ) (*LikeMQ, error) {
 	if base == nil {
 		return nil, errors.New("rabbitmq base is nil")
 	}
-	if err := base.DeclareTopic(likeExchange, likeQueue, likeBindingKey); err != nil {
+	if err := base.DeclareTopicWithDLQ(likeExchange, LikeQueueName, likeBindingKey, likeDLX, LikeDLQName, "#"); err != nil {
 		return nil, err
 	}
 	return &LikeMQ{RabbitMQ: base}, nil

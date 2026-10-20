@@ -55,6 +55,7 @@ export type FeedVideoItem = {
 export type ListLatestResponse = {
   video_list: FeedVideoItem[]
   next_time: number
+  next_id?: number
   has_more: boolean
 }
 

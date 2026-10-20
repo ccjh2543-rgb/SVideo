@@ -1,13 +1,20 @@
 package http
 
 import (
+	"context"
 	"log"
+	"time"
 
 	"feedsystem_video_go/internal/account"
 	appaccount "feedsystem_video_go/internal/application/account"
 	domainaccount "feedsystem_video_go/internal/domain/account"
 	"feedsystem_video_go/internal/feed"
+	timelineredis "feedsystem_video_go/internal/infrastructure/cache/redis"
+	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	"feedsystem_video_go/internal/interfaces/ws"
+	cachelib "feedsystem_video_go/internal/middleware/cache"
+	"feedsystem_video_go/internal/middleware/idempotency"
 	"feedsystem_video_go/internal/middleware/jwt"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/middleware/ratelimit"
@@ -28,6 +35,7 @@ func SetRouter(
 	rmq *rabbitmq.RabbitMQ,
 	accountApp *appaccount.Service,
 	tokens domainaccount.TokenService,
+	wsHandler *ws.Handler,
 ) *gin.Engine {
 	r := gin.Default()
 	if err := r.SetTrustedProxies(nil); err != nil {
@@ -35,6 +43,9 @@ func SetRouter(
 	}
 	r.MaxMultipartMemory = 256 << 20      // 256MB
 	r.Static("/static", "./.run/uploads") // 静态文件映射
+	if wsHandler != nil {
+		r.GET("/ws", wsHandler.Handle)
+	}
 
 	// 通用限流器：登录/注册按 IP，业务写操作按账号，Feed 按账号或 IP。
 	registerLimit := ratelimit.TokenBucket(cache, "account:register", ratelimit.TokenBucketConfig{
@@ -68,6 +79,11 @@ func SetRouter(
 		Capacity: 30, RefillPerSecond: 10,
 	}, ratelimit.KeyByAccountOrIP)
 
+	publishIdempotency := idempotency.Require(cache, "video:publish", 24*time.Hour)
+	likeIdempotency := idempotency.Require(cache, "video:like", 24*time.Hour)
+	unlikeIdempotency := idempotency.Require(cache, "video:unlike", 24*time.Hour)
+	commentIdempotency := idempotency.Require(cache, "video:comment", 24*time.Hour)
+
 	// account
 	accountRepository := account.NewAccountRepository(db)
 	accountService := account.NewAccountService(accountRepository, cache)
@@ -91,7 +107,17 @@ func SetRouter(
 		log.Printf("PopularityMQ init failed (mq disabled): %v", err)
 		popularityMQ = nil
 	}
-	videoService := video.NewVideoService(videoRepository, cache, popularityMQ)
+	bloom := cachelib.NewBloomFilter(cache, "bloom:video_ids", 0, 0)
+	videoService := video.NewVideoService(videoRepository, cache, popularityMQ, bloom)
+	if cache != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := videoService.RebuildBloom(ctx); err != nil {
+				log.Printf("Rebuild video bloom filter failed: %v", err)
+			}
+		}()
+	}
 	videoHandler := video.NewVideoHandler(videoService, accountService)
 	videoGroup := r.Group("/video")
 	{
@@ -99,7 +125,7 @@ func SetRouter(
 		videoGroup.POST("/getDetail", videoHandler.GetDetail)
 		videoGroup.POST("/uploadVideo", jwt.JWTAuth(tokens), uploadLimit, videoHandler.UploadVideo)
 		videoGroup.POST("/uploadCover", jwt.JWTAuth(tokens), uploadLimit, videoHandler.UploadCover)
-		videoGroup.POST("/publish", jwt.JWTAuth(tokens), publishLimit, videoHandler.PublishVideo)
+		videoGroup.POST("/publish", jwt.JWTAuth(tokens), publishLimit, publishIdempotency, videoHandler.PublishVideo)
 	}
 
 	// like
@@ -113,8 +139,8 @@ func SetRouter(
 	likeHandler := video.NewLikeHandler(likeService)
 	likeGroup := r.Group("/like")
 	{
-		likeGroup.POST("/like", jwt.JWTAuth(tokens), likeLimit, likeHandler.Like)
-		likeGroup.POST("/unlike", jwt.JWTAuth(tokens), likeLimit, likeHandler.Unlike)
+		likeGroup.POST("/like", jwt.JWTAuth(tokens), likeLimit, likeIdempotency, likeHandler.Like)
+		likeGroup.POST("/unlike", jwt.JWTAuth(tokens), likeLimit, unlikeIdempotency, likeHandler.Unlike)
 		likeGroup.POST("/isLiked", jwt.JWTAuth(tokens), likeHandler.IsLiked)
 		likeGroup.POST("/listMyLikedVideos", jwt.JWTAuth(tokens), likeHandler.ListMyLikedVideos)
 	}
@@ -131,7 +157,7 @@ func SetRouter(
 	commentGroup := r.Group("/comment")
 	{
 		commentGroup.POST("/listAll", commentHandler.GetAllComments)
-		commentGroup.POST("/publish", jwt.JWTAuth(tokens), commentLimit, commentHandler.PublishComment)
+		commentGroup.POST("/publish", jwt.JWTAuth(tokens), commentLimit, commentIdempotency, commentHandler.PublishComment)
 		commentGroup.POST("/delete", jwt.JWTAuth(tokens), commentHandler.DeleteComment)
 	}
 
@@ -154,7 +180,13 @@ func SetRouter(
 
 	// feed
 	feedRepository := feed.NewFeedRepository(db)
-	feedService := feed.NewFeedService(feedRepository, likeRepository, cache)
+	feedService := feed.NewFeedService(
+		feedRepository,
+		likeRepository,
+		cache,
+		timelineredis.NewTimelineRepository(cache),
+		accountmysql.NewCreatorStatsRepository(db),
+	)
 	feedHandler := feed.NewFeedHandler(feedService)
 	feedGroup := r.Group("/feed")
 	{
@@ -172,7 +204,7 @@ func SetRouter(
 	}
 	if timelineMQ != nil {
 		worker.StartOutboxPoller(db, timelineMQ)
-		worker.StartConsumer(timelineMQ, "video.timeline.update.queue", cache)
+		worker.StartConsumer(timelineMQ, rabbitmq.TimelineQueueName, cache)
 	}
 	return r
 }

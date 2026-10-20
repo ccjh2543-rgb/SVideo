@@ -16,6 +16,11 @@ package feed
 import (
 	"context"
 	"encoding/json"
+	"sort"
+
+	domaincreator "feedsystem_video_go/internal/domain/creator"
+	domainfeed "feedsystem_video_go/internal/domain/feed"
+	cachelib "feedsystem_video_go/internal/middleware/cache"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/video"
 	"fmt"
@@ -36,7 +41,8 @@ type FeedService struct {
 	likeRepo     *video.LikeRepository
 	rediscache   *rediscache.Client // L2 分布式缓存
 	localcache   *cache.Cache       // L1 本地内存缓存（3秒）
-	cacheTTL     time.Duration      // 缓存过期时间
+	timelineRepo domainfeed.TimelineRepository
+	creatorRepo  domaincreator.Repository
 	requestGroup singleflight.Group // 防缓存击穿神器：1000个并发查同一条，只有1个查DB
 }
 
@@ -46,13 +52,20 @@ type CachedFeedData struct {
 }
 
 // NewFeedService 创建Feed流服务（依赖注入）
-func NewFeedService(repo *FeedRepository, likeRepo *video.LikeRepository, rediscache *rediscache.Client) *FeedService {
+func NewFeedService(
+	repo *FeedRepository,
+	likeRepo *video.LikeRepository,
+	rediscache *rediscache.Client,
+	timelineRepo domainfeed.TimelineRepository,
+	creatorRepo domaincreator.Repository,
+) *FeedService {
 	return &FeedService{
-		repo:       repo,
-		likeRepo:   likeRepo,
-		rediscache: rediscache,
-		localcache: cache.New(3*time.Second, 5*time.Second), // L1缓存3秒过期
-		cacheTTL:   24 * time.Hour,
+		repo:         repo,
+		likeRepo:     likeRepo,
+		rediscache:   rediscache,
+		localcache:   cache.New(3*time.Second, 5*time.Second), // L1缓存3秒过期
+		timelineRepo: timelineRepo,
+		creatorRepo:  creatorRepo,
 	}
 }
 
@@ -183,7 +196,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 					go func(k string, b []byte) {
 						setCtx, setCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 						defer setCancel()
-						f.rediscache.SetBytes(setCtx, k, b, time.Hour)
+						f.rediscache.SetBytes(setCtx, k, b, cachelib.Jitter(time.Hour, 0.2))
 					}(cachekey, b)
 				}
 
@@ -210,7 +223,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 // ListLatest 查询最新的视频列表，采用冷热分离 + 游标分页的策略。
 // 热数据（最近视频）存放在 Redis ZSET 中，冷数据（较旧视频）降级查询 MySQL。
 // 通过游标 latestBefore 实现顺序翻页，避免传统 offset 分页的数据重复/遗漏问题。
-func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore time.Time, viewerAccountID uint) (ListLatestResponse, error) {
+func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore time.Time, latestID uint, viewerAccountID uint) (ListLatestResponse, error) {
 	// ========== 第一步：检查 Redis ZSET 是否为空 ==========
 	// 利用 ZRangeWithScores 取出 ZSET 中分数最小的那一条（即最老的视频）。
 	// 范围 0,0 表示取下标 0 到 0 的元素（即第一个元素，因为 ZSET 按分数升序排列）。
@@ -231,7 +244,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 		v, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
 			// 直接无视游标，去 MySQL 捞最新的 1000 条数据作为 ZSET 的初始数据。
 			// 这里传入 time.Time{} 表示不限制时间，取全局最新。
-			dbVideos, err := f.repo.ListLatest(ctx, 1000, time.Time{})
+			dbVideos, err := f.repo.ListLatest(ctx, 1000, time.Time{}, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -264,7 +277,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 		}
 
 		// 缓存重建成功后，当前请求重新调用自身（递归一次），此时 ZSET 已有数据，将进入正常热/冷分支。
-		return f.ListLatest(ctx, limit, latestBefore, viewerAccountID)
+		return f.ListLatest(ctx, limit, latestBefore, latestID, viewerAccountID)
 	}
 
 	// ========== 第二步：确定冷热分界线 watermark ==========
@@ -286,7 +299,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 		// 此时使用针对个别用户的防并发锁，因为冷尾流量极小，可以用 limit+reqTime 组成锁 key。
 		sfKey := fmt.Sprintf("sf:cold:listLatest:%d:%d", limit, reqTime)
 		v, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
-			return f.repo.ListLatest(ctx, limit, latestBefore)
+			return f.repo.ListLatest(ctx, limit, latestBefore, latestID)
 		})
 		if err != nil {
 			return ListLatestResponse{}, err
@@ -296,14 +309,15 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 
 	} else {
 		// 情况 B：热数据区间 —— 请求时间 > 最老热数据的时间，先从 Redis ZSET 获取。
-		// 如果客户端传了游标，maxScore 设为 reqTime-1，避免重复返回游标时间点的那条视频。
+		// 使用 reqTime 作为上界（而不是 reqTime-1），再多取一些同分数据，随后按 (时间, ID) 过滤。
 		maxScore := "+inf"
 		if !latestBefore.IsZero() {
-			maxScore = fmt.Sprintf("%d", reqTime-1)
+			maxScore = fmt.Sprintf("%d", reqTime)
 		}
 
-		// ZRevRangeByScore 按分数从高到低（最新到最老）返回 limit 条视频 ID。
-		videoIDsStr, err := f.rediscache.ZRevRangeByScore(ctx, "feed:global_timeline", maxScore, "-inf", 0, int64(limit))
+		// 多取 50 条，覆盖同一毫秒发布的多条视频。
+		fetchLimit := int64(limit) + 50
+		videoIDsStr, err := f.rediscache.ZRevRangeByScore(ctx, "feed:global_timeline", maxScore, "-inf", 0, fetchLimit)
 		if err != nil {
 			return ListLatestResponse{}, err
 		}
@@ -324,24 +338,44 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 			}
 		}
 
+		// 同一毫秒兜底游标：时间相同则按 ID 继续倒序。
+		if !latestBefore.IsZero() {
+			cursorMs := latestBefore.UnixMilli()
+			filtered := make([]*video.Video, 0, len(baseVideos))
+			for _, item := range baseVideos {
+				itemMs := item.CreateTime.UnixMilli()
+				if itemMs < cursorMs || (itemMs == cursorMs && (latestID == 0 || item.ID < latestID)) {
+					filtered = append(filtered, item)
+				}
+			}
+			baseVideos = filtered
+		}
+		if len(baseVideos) > limit {
+			baseVideos = baseVideos[:limit]
+		}
+
 		// ========== 第四步：缝合冷热边界 ==========
 		// 如果从 Redis 拿到的数量不足 limit 条，说明热数据不够，需要跨入冷数据区间补全。
 		// 典型场景：ZSET 最后几页刚好跨过 watermark。
 		if len(baseVideos) < limit {
 			remainLimit := limit - len(baseVideos) // 还需要补多少条
 
-			// 确定冷数据的游标：取当前已拿到但未返回的最后一条视频的创建时间作为下次查询的起点。
+			// 确定冷数据的游标：取当前已拿到但未返回的最后一条视频的创建时间和 ID。
 			var coldCursor time.Time
+			var coldCursorID uint
 			if len(baseVideos) > 0 {
-				coldCursor = baseVideos[len(baseVideos)-1].CreateTime
+				last := baseVideos[len(baseVideos)-1]
+				coldCursor = last.CreateTime
+				coldCursorID = last.ID
 			} else {
 				coldCursor = latestBefore
+				coldCursorID = latestID
 			}
 
 			// 用 singleflight 防止相同补全查询的并发。
-			sfKey := fmt.Sprintf("sf:stitch:listLatest:%d:%d", remainLimit, coldCursor.UnixMilli())
+			sfKey := fmt.Sprintf("sf:stitch:listLatest:%d:%d:%d", remainLimit, coldCursor.UnixMilli(), coldCursorID)
 			v, err, _ := f.requestGroup.Do(sfKey, func() (interface{}, error) {
-				return f.repo.ListLatest(ctx, remainLimit, coldCursor)
+				return f.repo.ListLatest(ctx, remainLimit, coldCursor, coldCursorID)
 			})
 
 			if err == nil {
@@ -355,9 +389,13 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 
 	// ========== 第五步：构建返回值 ==========
 	var nextTime int64
+	var nextID *uint
 	if len(baseVideos) > 0 {
-		// 取本页最后一条视频的时间戳（毫秒）作为下一次请求的游标（NextTime）。
-		nextTime = baseVideos[len(baseVideos)-1].CreateTime.UnixMilli()
+		// 取本页最后一条视频的时间戳（毫秒）和 ID 作为下一次请求的游标。
+		last := baseVideos[len(baseVideos)-1]
+		nextTime = last.CreateTime.UnixMilli()
+		id := last.ID
+		nextID = &id
 	}
 	// 判断是否还有更多数据：如果实际返回数量等于请求的 limit，则认为有下一页；否则没有。
 	hasMore := len(baseVideos) == limit
@@ -371,6 +409,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 	return ListLatestResponse{
 		VideoList: feedVideos,
 		NextTime:  nextTime,
+		NextID:    nextID,
 		HasMore:   hasMore,
 	}, nil
 }
@@ -414,147 +453,188 @@ func (f *FeedService) ListLikesCount(ctx context.Context, limit int, cursor *Lik
 }
 
 // ListByFollowing 获取当前用户关注的人发布的视频，按时间倒序分页。
-// limit 指定每页数量。
-// latestBefore 用于游标分页，表示上一页最后一条视频的创建时间，本页返回此时间之前的视频。
-// viewerAccountID 用于确定关注列表以及标记点赞状态。
-// 此方法包含 Redis 缓存逻辑，以加速热门查询。
+//
+// 优先走推拉结合时间线：
+//   - 读自己的 Inbox（小 V 写扩散的内容）
+//   - 批量读关注的大 V Outbox
+//   - 合并自己的 Outbox，保证发布后自己能看到
+//
+// Redis 不可用或时间线为空时降级到 MySQL 子查询。
 func (f *FeedService) ListByFollowing(ctx context.Context, limit int, latestBefore time.Time, viewerAccountID uint) (ListByFollowingResponse, error) {
-	// 实际从数据库查询并构建响应的函数，避免重复代码
-	doListByFollowingFromDB := func() (ListByFollowingResponse, error) {
-		videos, err := f.repo.ListByFollowing(ctx, limit, viewerAccountID, latestBefore)
-		if err != nil {
-			return ListByFollowingResponse{}, err
-		}
-
-		// 计算下一页的游标：最后一条视频的创建时间戳
-		var nextTime int64
-		if len(videos) > 0 {
-			nextTime = videos[len(videos)-1].CreateTime.Unix()
-		} else {
-			nextTime = 0
-		}
-
-		hasMore := len(videos) == limit
-
-		// 为视频列表补充点赞信息
-		feedVideos, err := f.buildFeedVideos(ctx, videos, viewerAccountID)
-		if err != nil {
-			return ListByFollowingResponse{}, err
-		}
-
-		return ListByFollowingResponse{
-			VideoList: feedVideos,
-			NextTime:  nextTime,
-			HasMore:   hasMore,
-		}, nil
+	if viewerAccountID == 0 {
+		return ListByFollowingResponse{}, nil
 	}
 
-	// 缓存逻辑：仅当用户已登录且缓存可用时尝试读取缓存
-	var cacheKey string
-	if viewerAccountID != 0 && f.rediscache != nil {
-		before := int64(0)
-		if !latestBefore.IsZero() {
-			before = latestBefore.Unix()
-		}
-		// 缓存键由 limit、用户ID和游标组成，保证缓存命中正确
-		cacheKey = fmt.Sprintf("feed:listByFollowing:limit=%d:accountID=%d:before=%d", limit, viewerAccountID, before)
-		cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-
-		// 尝试从缓存直接获取
-		b, err := f.rediscache.GetBytes(cacheCtx, cacheKey)
+	if f.timelineRepo != nil && f.creatorRepo != nil {
+		resp, err := f.listByFollowingHybrid(ctx, limit, latestBefore, viewerAccountID)
 		if err == nil {
-			var cached ListByFollowingResponse
-			if err := json.Unmarshal(b, &cached); err == nil {
-				return cached, nil // 缓存命中，直接返回
-			}
-		} else if rediscache.IsMiss(err) { // 缓存未命中，需要防缓存击穿
-			lockKey := "lock:" + cacheKey
-			// 尝试获取分布式锁，锁的超时时间为500ms
-			token, locked, _ := f.rediscache.Lock(cacheCtx, lockKey, 500*time.Millisecond)
-			if locked {
-				// 获得锁后，再次检查缓存（可能其他协程已写）
-				defer func() { _ = f.rediscache.Unlock(context.Background(), lockKey, token) }()
-				if b, err := f.rediscache.GetBytes(cacheCtx, cacheKey); err == nil {
-					var cached ListByFollowingResponse
-					if err := json.Unmarshal(b, &cached); err == nil {
-						return cached, nil
-					}
-				} else { // 确认缓存确实未命中，从数据库加载并回写缓存
-					resp, err := doListByFollowingFromDB()
-					if err != nil {
-						return ListByFollowingResponse{}, err
-					}
-					if b, err := json.Marshal(resp); err == nil {
-						_ = f.rediscache.SetBytes(cacheCtx, cacheKey, b, f.cacheTTL)
-					}
-					return resp, nil
-				}
-			} else {
-				// 未获取锁，等待一小段时间并重试读取缓存（最多5次）
-				for i := 0; i < 5; i++ {
-					time.Sleep(20 * time.Millisecond)
-					if b, err := f.rediscache.GetBytes(cacheCtx, cacheKey); err == nil {
-						var cached ListByFollowingResponse
-						if err := json.Unmarshal(b, &cached); err == nil {
-							return cached, nil
-						}
-					}
-				}
-			}
+			return resp, nil
 		}
-		// 如果缓存存在但解码失败或其它错误，继续走数据库查询
+		log.Printf("hybrid following feed failed, fallback to MySQL: %v", err)
 	}
 
-	// 无缓存或缓存未命中/出错，从数据库查询
-	resp, err := doListByFollowingFromDB()
+	return f.listByFollowingFromDB(ctx, limit, latestBefore, viewerAccountID)
+}
+
+// listByFollowingHybrid 合并 Inbox、大 V Outbox 和自己的 Outbox。
+func (f *FeedService) listByFollowingHybrid(ctx context.Context, limit int, latestBefore time.Time, viewerAccountID uint) (ListByFollowingResponse, error) {
+	cursorMs := int64(0)
+	if !latestBefore.IsZero() {
+		cursorMs = latestBefore.UnixMilli()
+	}
+
+	stats, err := f.creatorRepo.ListFollowing(ctx, viewerAccountID)
 	if err != nil {
 		return ListByFollowingResponse{}, err
 	}
 
-	// 如果启用了缓存，则将数据库结果写入缓存
-	if cacheKey != "" {
-		if b, err := json.Marshal(resp); err == nil {
-			cacheCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-			defer cancel()
-			_ = f.rediscache.SetBytes(cacheCtx, cacheKey, b, f.cacheTTL)
+	bigVAuthorIDs := make([]uint, 0)
+	for _, item := range stats {
+		if item.IsBig || item.FansCount >= domaincreator.BigVFansThreshold {
+			bigVAuthorIDs = append(bigVAuthorIDs, item.AuthorID)
 		}
 	}
-	return resp, nil
+	// 限制单次合并的大 V 数量，避免关注几百个大 V 时读放大失控。
+	const maxBigVAuthors = 100
+	if len(bigVAuthorIDs) > maxBigVAuthors {
+		bigVAuthorIDs = bigVAuthorIDs[:maxBigVAuthors]
+	}
+
+	entries, err := f.timelineRepo.ReadInbox(ctx, viewerAccountID, cursorMs, limit)
+	if err != nil {
+		return ListByFollowingResponse{}, err
+	}
+
+	if len(bigVAuthorIDs) > 0 {
+		groups, err := f.timelineRepo.ReadOutboxes(ctx, bigVAuthorIDs, cursorMs, limit)
+		if err != nil {
+			return ListByFollowingResponse{}, err
+		}
+		for _, group := range groups {
+			entries = append(entries, group...)
+		}
+	}
+
+	// 合并自己的发件箱，保证作者发布后能立刻在自己的关注流看到。
+	ownEntries, err := f.timelineRepo.ReadOutbox(ctx, viewerAccountID, cursorMs, limit)
+	if err != nil {
+		return ListByFollowingResponse{}, err
+	}
+	entries = append(entries, ownEntries...)
+
+	merged := mergeTimelineEntries(entries, limit)
+	if len(merged) == 0 {
+		// 第一页没有缓存时回源数据库，兼顾新用户和历史数据。
+		if latestBefore.IsZero() {
+			return f.listByFollowingFromDB(ctx, limit, latestBefore, viewerAccountID)
+		}
+		return ListByFollowingResponse{VideoList: []FeedVideoItem{}, HasMore: false}, nil
+	}
+
+	videoIDs := make([]uint, 0, len(merged))
+	for _, entry := range merged {
+		videoIDs = append(videoIDs, entry.VideoID)
+	}
+	videos, err := f.GetVideoByIDs(ctx, videoIDs)
+	if err != nil {
+		return ListByFollowingResponse{}, err
+	}
+	feedVideos, err := f.buildFeedVideos(ctx, videos, viewerAccountID)
+	if err != nil {
+		return ListByFollowingResponse{}, err
+	}
+
+	var nextTime int64
+	if len(feedVideos) > 0 {
+		nextTime = feedVideos[len(feedVideos)-1].CreateTime
+	}
+	return ListByFollowingResponse{
+		VideoList: feedVideos,
+		NextTime:  nextTime,
+		HasMore:   len(feedVideos) == limit,
+	}, nil
+}
+
+// listByFollowingFromDB 是推拉结合不可用时的降级路径。
+func (f *FeedService) listByFollowingFromDB(ctx context.Context, limit int, latestBefore time.Time, viewerAccountID uint) (ListByFollowingResponse, error) {
+	videos, err := f.repo.ListByFollowing(ctx, limit, viewerAccountID, latestBefore)
+	if err != nil {
+		return ListByFollowingResponse{}, err
+	}
+
+	var nextTime int64
+	if len(videos) > 0 {
+		nextTime = videos[len(videos)-1].CreateTime.Unix()
+	}
+	feedVideos, err := f.buildFeedVideos(ctx, videos, viewerAccountID)
+	if err != nil {
+		return ListByFollowingResponse{}, err
+	}
+	return ListByFollowingResponse{
+		VideoList: feedVideos,
+		NextTime:  nextTime,
+		HasMore:   len(videos) == limit,
+	}, nil
+}
+
+// mergeTimelineEntries 对多个来源的时间线去重并按时间倒序排序。
+func mergeTimelineEntries(entries []domainfeed.TimelineEntry, limit int) []domainfeed.TimelineEntry {
+	byVideoID := make(map[uint]int64, len(entries))
+	for _, entry := range entries {
+		if entry.VideoID == 0 {
+			continue
+		}
+		if existing, ok := byVideoID[entry.VideoID]; !ok || entry.Score > existing {
+			byVideoID[entry.VideoID] = entry.Score
+		}
+	}
+
+	merged := make([]domainfeed.TimelineEntry, 0, len(byVideoID))
+	for videoID, score := range byVideoID {
+		merged = append(merged, domainfeed.TimelineEntry{VideoID: videoID, Score: score})
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Score == merged[j].Score {
+			return merged[i].VideoID > merged[j].VideoID
+		}
+		return merged[i].Score > merged[j].Score
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
 }
 
 // ListByPopularity 按热度（Popularity）降序查询视频列表，支持分页。
-// 该方法优先使用 Redis 合并缓存的热度排行榜（1分钟粒度，60分钟窗口），
-// 如果 Redis 不可用或数据不存在则回退到数据库查询。
-// reqAsOf：请求的时间锚点，用于确定 Redis 快照版本，提供稳定翻页体验。
-// offset：Redis 分页时的起始偏移量。
-// latestPopularity, latestBefore, latestIDBefore：用于数据库分页的游标（三位一体），确保准确翻页。
+//
+// 热度采用 24 个小时桶 + 线性权重衰减：
+//   - 当前小时权重 1.0
+//   - 越早的小时权重越低，最老小时权重 1/24
+//   - 合并结果写入快照，保证同一 as_of 下翻页稳定
+//
+// Redis 不可用或数据不存在时回退到数据库三字段游标分页。
 func (f *FeedService) ListByPopularity(ctx context.Context, limit int, reqAsOf int64, offset int, viewerAccountID uint, latestPopularity int64, latestBefore time.Time, latestIDBefore uint) (ListByPopularityResponse, error) {
 	// 优先读取 Redis 热榜
 	if f.rediscache != nil {
-		// 确定快照时间：按分钟截断，以提供稳定的翻页视图
-		asOf := time.Now().UTC().Truncate(time.Minute)
+		// 按小时截断，提供稳定的翻页视图。
+		asOf := time.Now().UTC().Truncate(time.Hour)
 		if reqAsOf > 0 {
-			asOf = time.Unix(reqAsOf, 0).UTC().Truncate(time.Minute)
+			asOf = time.Unix(reqAsOf, 0).UTC().Truncate(time.Hour)
 		}
 
-		// 构建最近60分钟的热度窗口（60个1分钟ZSet的键）
-		const win = 60
-		keys := make([]string, 0, win)
-		for i := 0; i < win; i++ {
-			keys = append(keys, "hot:video:1m:"+asOf.Add(-time.Duration(i)*time.Minute).Format("200601021504"))
-		}
+		const windowHours = 24
+		keys := hotWindowKeys(asOf, windowHours)
+		weights := linearDecayWeights(windowHours)
 
-		// 合并的快照键，用于缓存合并结果，避免频繁 ZUnionStore
-		dest := "hot:video:merge:1m:" + asOf.Format("200601021504")
+		// 合并快照键，避免每次翻页都重新 ZUnionStore。
+		dest := "hot:video:merge:1h:" + asOf.Format("2006010215")
 		opCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
 		defer cancel()
 
-		// 检查合并快照是否存在，若不存在则执行合并并设置过期时间
 		exists, _ := f.rediscache.Exists(opCtx, dest)
 		if !exists {
-			_ = f.rediscache.ZUnionStore(opCtx, dest, keys, "SUM")
-			_ = f.rediscache.Expire(opCtx, dest, 2*time.Minute) // 为后续翻页保留足够长的时间
+			_ = f.rediscache.ZUnionStoreWeighted(opCtx, dest, keys, weights, "SUM")
+			_ = f.rediscache.Expire(opCtx, dest, 10*time.Minute)
 		}
 
 		// 从合并结果中按热度倒序分页获取视频ID
@@ -651,6 +731,30 @@ func (f *FeedService) ListByPopularity(ctx context.Context, limit int, reqAsOf i
 		resp.NextLatestIDBefore = &nextID
 	}
 	return resp, nil
+}
+
+// hotWindowKeys 生成从 asOf 往前共 hours 个小时桶的 key。
+func hotWindowKeys(asOf time.Time, hours int) []string {
+	if hours <= 0 {
+		return nil
+	}
+	keys := make([]string, 0, hours)
+	for i := 0; i < hours; i++ {
+		keys = append(keys, "hot:video:1h:"+asOf.Add(-time.Duration(i)*time.Hour).Format("2006010215"))
+	}
+	return keys
+}
+
+// linearDecayWeights 生成线性衰减权重：最新小时为 1.0，最老小时为 1/hours。
+func linearDecayWeights(hours int) []float64 {
+	if hours <= 0 {
+		return nil
+	}
+	weights := make([]float64, hours)
+	for i := 0; i < hours; i++ {
+		weights[i] = float64(hours-i) / float64(hours)
+	}
+	return weights
 }
 
 // buildFeedVideos 根据视频实体列表构建前端使用的 FeedVideoItem 列表，

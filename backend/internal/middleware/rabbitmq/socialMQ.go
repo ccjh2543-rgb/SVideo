@@ -13,8 +13,10 @@ type SocialMQ struct {
 
 const (
 	socialExchange   = "social.events"
-	socialQueue      = "social.events"
+	SocialQueueName  = "social.events.v2"
 	socialBindingKey = "social.*"
+	socialDLX        = "social.events.dlx"
+	SocialDLQName    = "social.events.dlq"
 
 	socialFollowRK   = "social.follow"
 	socialUnfollowRK = "social.unfollow"
@@ -32,7 +34,7 @@ func NewSocialMQ(base *RabbitMQ) (*SocialMQ, error) {
 	if base == nil {
 		return nil, errors.New("rabbitmq base is nil")
 	}
-	if err := base.DeclareTopic(socialExchange, socialQueue, socialBindingKey); err != nil {
+	if err := base.DeclareTopicWithDLQ(socialExchange, SocialQueueName, socialBindingKey, socialDLX, SocialDLQName, "#"); err != nil {
 		return nil, err
 	}
 	return &SocialMQ{RabbitMQ: base}, nil

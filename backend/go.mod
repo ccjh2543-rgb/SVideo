@@ -16,6 +16,7 @@ require (
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 )
 

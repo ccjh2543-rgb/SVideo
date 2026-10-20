@@ -8,6 +8,7 @@ import (
 	apphttp "feedsystem_video_go/internal/http"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
 	"feedsystem_video_go/internal/infrastructure/security"
+	"feedsystem_video_go/internal/interfaces/ws"
 	rabbitmq "feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/observability"
@@ -104,8 +105,20 @@ func main() {
 		security.NewBcryptHasher(),
 	)
 
+	// WebSocket 通知：Hub 管理本机连接，Redis Pub/Sub 负责多实例广播。
+	wsHub := ws.NewHub()
+	wsNotifier := ws.NewRedisNotifier(cache, wsHub)
+	wsCtx, wsCancel := context.WithCancel(context.Background())
+	defer wsCancel()
+	go func() {
+		if err := wsNotifier.Run(wsCtx); err != nil && err != context.Canceled {
+			log.Printf("WebSocket notifier stopped: %v", err)
+		}
+	}()
+	wsHandler := ws.NewHandler(tokens, wsHub)
+
 	// 设置路由
-	r := apphttp.SetRouter(sqlDB, cache, rmq, accountApp, tokens)
+	r := apphttp.SetRouter(sqlDB, cache, rmq, accountApp, tokens, wsHandler)
 	log.Printf("Server is running on port %d", cfg.Server.Port)
 	if err := r.Run(":" + strconv.Itoa(cfg.Server.Port)); err != nil {
 		log.Fatalf("Failed to run server: %v", err)

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	cachelib "feedsystem_video_go/internal/middleware/cache"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 
@@ -19,10 +20,22 @@ type VideoService struct {
 	cache        *rediscache.Client
 	cacheTTL     time.Duration
 	popularityMQ *rabbitmq.PopularityMQ
+	bloom        *cachelib.BloomFilter
 }
 
-func NewVideoService(repo *VideoRepository, cache *rediscache.Client, popularityMQ *rabbitmq.PopularityMQ) *VideoService {
-	return &VideoService{repo: repo, cache: cache, cacheTTL: 5 * time.Minute, popularityMQ: popularityMQ}
+func NewVideoService(
+	repo *VideoRepository,
+	cache *rediscache.Client,
+	popularityMQ *rabbitmq.PopularityMQ,
+	bloom *cachelib.BloomFilter,
+) *VideoService {
+	return &VideoService{
+		repo:         repo,
+		cache:        cache,
+		cacheTTL:     5 * time.Minute,
+		popularityMQ: popularityMQ,
+		bloom:        bloom,
+	}
 }
 
 func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
@@ -58,6 +71,7 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
 		// 使用刚生成的 video.ID 关联消息，保证事件与业务数据的对应关系
 		msg := OutboxMsg{
 			VideoID:    video.ID,          // 关联的视频主键，必须在上一步 Create 后才能拿到
+			AuthorID:   video.AuthorID,    // 作者 ID，供 Fan-out Worker 使用
 			EventType:  "video_published", // 事件类型，后续消息分发器会据此路由
 			Status:     "pending",         // 初始状态为 pending，表示待发送
 			CreateTime: video.CreateTime,  // 沿用视频的创建时间，保持时间一致性
@@ -76,8 +90,15 @@ func (vs *VideoService) Publish(ctx context.Context, video *Video) error {
 		// 提交后，视频和消息记录才会真正持久化到磁盘
 		return nil
 	})
+	if err != nil {
+		return err
+	}
 
-	return err
+	// 写入布隆过滤器，降低不存在视频 ID 的穿透压力。
+	if vs.bloom != nil {
+		_ = vs.bloom.Add(ctx, uint64(video.ID))
+	}
+	return nil
 }
 
 func (vs *VideoService) Delete(ctx context.Context, id uint, authorID uint) error {
@@ -109,47 +130,42 @@ func (vs *VideoService) ListByAuthorID(ctx context.Context, authorID uint) ([]Vi
 	return videos, nil
 }
 
+// GetDetail 查询视频详情。
+//
+// 缓存策略：
+//   - 布隆过滤器拦截不存在的 ID
+//   - 空值缓存兜底布隆误判
+//   - 逻辑过期：过期后先返回旧值，再异步重建
+//   - 分布式锁防止缓存击穿
 func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) {
+	if id == 0 {
+		return nil, errors.New("video id is required")
+	}
 	cacheKey := fmt.Sprintf("video:detail:id=%d", id)
+	nullKey := fmt.Sprintf("video:null:id=%d", id)
 
-	getCached := func() (*Video, bool) {
-		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-
-		b, err := vs.cache.GetBytes(opCtx, cacheKey)
-		if err != nil {
-			return nil, false
+	if vs.cache != nil {
+		if b, err := vs.cache.GetBytes(ctx, nullKey); err == nil && len(b) > 0 {
+			return nil, errors.New("video not found")
 		}
-		var cached Video
-		if err := json.Unmarshal(b, &cached); err != nil {
-			return nil, false
-		}
-		return &cached, true
 	}
 
-	setCached := func(video *Video) {
-		b, err := json.Marshal(video)
-		if err != nil {
-			return
+	if vs.bloom != nil {
+		exists, err := vs.bloom.Exists(ctx, uint64(id))
+		if err == nil && !exists {
+			return nil, errors.New("video not found")
 		}
-		opCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-		_ = vs.cache.SetBytes(opCtx, cacheKey, b, vs.cacheTTL)
 	}
 
 	if vs.cache != nil {
-		if v, ok := getCached(); ok {
-			return v, nil
+		if video, expired, found := vs.getDetailCache(ctx, cacheKey); found {
+			if expired {
+				go vs.refreshDetail(id)
+			}
+			return video, nil
 		}
 
-		// 再次尝试读取缓存，确认确实未命中（防止竞态）
-		if v, ok := getCached(); ok {
-			return v, nil
-		}
-
-		// 缓存未命中（Redis 返回 nil），尝试获取分布式锁
 		lockKey := "lock:" + cacheKey
-
 		lockCtx, lockCancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		token, locked, lockErr := vs.cache.Lock(lockCtx, lockKey, 2*time.Second)
 		lockCancel()
@@ -157,39 +173,118 @@ func (vs *VideoService) GetDetail(ctx context.Context, id uint) (*Video, error) 
 		if lockErr == nil && locked {
 			defer func() { _ = vs.cache.Unlock(context.Background(), lockKey, token) }()
 
-			if v, ok := getCached(); ok {
-				return v, nil
+			if video, _, found := vs.getDetailCache(ctx, cacheKey); found {
+				return video, nil
 			}
-
 			video, err := vs.repo.GetByID(ctx, id)
 			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					vs.setNullCache(id)
+					return nil, errors.New("video not found")
+				}
 				return nil, err
 			}
-			setCached(video)
+			vs.setDetailCache(ctx, video)
 			return video, nil
 		}
 
-		// 没拿到锁：等待别人回填缓存
 		for i := 0; i < 5; i++ {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(20 * time.Millisecond):
 			}
-			if v, ok := getCached(); ok {
-				return v, nil
+			if video, _, found := vs.getDetailCache(ctx, cacheKey); found {
+				return video, nil
 			}
 		}
 	}
 
 	video, err := vs.repo.GetByID(ctx, id)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			vs.setNullCache(id)
+			return nil, errors.New("video not found")
+		}
 		return nil, err
 	}
 	if vs.cache != nil {
-		setCached(video)
+		vs.setDetailCache(ctx, video)
 	}
 	return video, nil
+}
+
+// getDetailCache 读取逻辑过期缓存。
+func (vs *VideoService) getDetailCache(ctx context.Context, cacheKey string) (*Video, bool, bool) {
+	data, expired, found, err := cachelib.GetLogical(ctx, vs.cache, cacheKey)
+	if err != nil || !found {
+		return nil, false, false
+	}
+	var video Video
+	if err := json.Unmarshal(data, &video); err != nil {
+		return nil, false, false
+	}
+	return &video, expired, true
+}
+
+// setDetailCache 写入逻辑过期缓存。
+func (vs *VideoService) setDetailCache(ctx context.Context, video *Video) {
+	if vs.cache == nil || video == nil {
+		return
+	}
+	data, err := json.Marshal(video)
+	if err != nil {
+		return
+	}
+	physicalTTL := cachelib.Jitter(30*time.Minute, 0.2)
+	_ = cachelib.SetLogical(ctx, vs.cache, fmt.Sprintf("video:detail:id=%d", video.ID), data, vs.cacheTTL, physicalTTL)
+}
+
+// setNullCache 写入空值缓存，防止布隆误判后持续穿透数据库。
+func (vs *VideoService) setNullCache(id uint) {
+	if vs.cache == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = vs.cache.SetBytes(ctx, fmt.Sprintf("video:null:id=%d", id), []byte("1"), cachelib.Jitter(time.Minute, 0.2))
+}
+
+// refreshDetail 异步重建逻辑过期缓存。
+func (vs *VideoService) refreshDetail(id uint) {
+	if vs.cache == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cacheKey := fmt.Sprintf("video:detail:id=%d", id)
+	lockKey := "lock:" + cacheKey
+	token, locked, err := vs.cache.Lock(ctx, lockKey, 2*time.Second)
+	if err != nil || !locked {
+		return
+	}
+	defer func() { _ = vs.cache.Unlock(context.Background(), lockKey, token) }()
+
+	// 双重检查：其他请求可能已经完成重建。
+	if _, expired, found := vs.getDetailCache(ctx, cacheKey); found && !expired {
+		return
+	}
+	video, err := vs.repo.GetByID(ctx, id)
+	if err != nil {
+		return
+	}
+	vs.setDetailCache(ctx, video)
+}
+
+// RebuildBloom 从数据库加载全部视频 ID 重建布隆过滤器。
+func (vs *VideoService) RebuildBloom(ctx context.Context) error {
+	if vs.bloom == nil {
+		return nil
+	}
+	return vs.bloom.Rebuild(ctx, func(afterID uint, limit int) ([]uint, error) {
+		return vs.repo.ListIDsAfter(ctx, afterID, limit)
+	})
 }
 
 func (vs *VideoService) UpdateLikesCount(ctx context.Context, id uint, likesCount int64) error {

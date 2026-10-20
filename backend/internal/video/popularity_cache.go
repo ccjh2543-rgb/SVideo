@@ -26,13 +26,12 @@ func UpdatePopularityCache(ctx context.Context, cache *rediscache.Client, id uin
 	// 清理操作也能尽量执行，避免脏缓存残留。
 	_ = cache.Del(context.Background(), fmt.Sprintf("video:detail:id=%d", id))
 
-	// -------------------- 2. 更新分钟级热度排行榜 --------------------
-	// 获取当前 UTC 时间，并截断到分钟，保证同一分钟内的所有更新落在同一个窗口中。
-	now := time.Now().UTC().Truncate(time.Minute)
+	// -------------------- 2. 更新小时级热度排行榜 --------------------
+	// 以小时为桶，配合读取时的线性权重衰减，形成 24 小时滑动窗口。
+	now := time.Now().UTC().Truncate(time.Hour)
 
-	// 构造窗口 key，格式示例: "hot:video:1m:202601281530"
-	// 这里的 "1m" 表示窗口粒度为1分钟，后续如果要扩展为5分钟、1小时，可通过不同前缀区分。
-	windowKey := "hot:video:1m:" + now.Format("200601021504")
+	// 构造窗口 key，格式示例: "hot:video:1h:2026012815"
+	windowKey := "hot:video:1h:" + now.Format("2006010215")
 
 	// 将视频ID转换为字符串，作为有序集合中的成员（member）。
 	member := strconv.FormatUint(uint64(id), 10)
@@ -46,7 +45,6 @@ func UpdatePopularityCache(ctx context.Context, cache *rediscache.Client, id uin
 	// 若 member 不存在，则创建并赋予该分数。
 	_ = cache.ZincrBy(opCtx, windowKey, member, float64(change))
 
-	// 为窗口 key 设置过期时间 2 小时。
-	// 分钟级窗口只需保留最近一段时间即可，避免 Redis 内存无限增长。
-	_ = cache.Expire(opCtx, windowKey, 2*time.Hour)
+	// 小时桶保留 48 小时，足够覆盖 24 小时窗口和快照计算。
+	_ = cache.Expire(opCtx, windowKey, 48*time.Hour)
 }

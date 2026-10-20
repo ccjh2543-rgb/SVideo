@@ -28,6 +28,8 @@ func AutoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&account.Account{},
 		&accountmysql.RefreshTokenModel{},
+		&accountmysql.CreatorStatsModel{},
+		&accountmysql.ProcessedEventModel{},
 		&video.Video{},
 		&video.Like{},
 		&video.Comment{},

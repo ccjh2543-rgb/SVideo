@@ -49,7 +49,7 @@ func NewFeedRepository(db *gorm.DB) *FeedRepository {
 //	非第一页：传入上一页最后一条的create_time
 //
 // 返回值：视频列表指针切片、查询错误
-func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time) ([]*video.Video, error) {
+func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time, latestID uint) ([]*video.Video, error) {
 	// 定义视频切片，用于接收数据库查询结果
 	var videos []*video.Video
 
@@ -65,9 +65,15 @@ func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBef
 	// 第一页：不传时间，直接查最新的N条
 	// 非第一页：只查询【发布时间 早于 上一页最后一条时间】的视频
 	if !latestBefore.IsZero() {
-		// 等价SQL：WHERE create_time < '上一页最后一条的发布时间'
-		// 这就是【业务游标】：用时间作为游标，定位下一页数据
-		query = query.Where("create_time < ?", latestBefore)
+		// 时间游标 + ID 兜底：同一毫秒发布多条视频时，用 ID 继续精确定位。
+		if latestID > 0 {
+			query = query.Where(
+				"(create_time < ?) OR (create_time = ? AND id < ?)",
+				latestBefore, latestBefore, latestID,
+			)
+		} else {
+			query = query.Where("create_time < ?", latestBefore)
+		}
 	}
 
 	// ===================== 第三步：执行最终查询 =====================

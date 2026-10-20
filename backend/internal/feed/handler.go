@@ -63,8 +63,13 @@ func (f *FeedHandler) ListLatest(c *gin.Context) {
 		viewerAccountID = 0
 	}
 
+	var latestID uint
+	if req.LatestID != nil {
+		latestID = *req.LatestID
+	}
+
 	// 5. 调用Service业务层
-	feedItems, err := f.service.ListLatest(c.Request.Context(), req.Limit, latestTime, viewerAccountID)
+	feedItems, err := f.service.ListLatest(c.Request.Context(), req.Limit, latestTime, latestID, viewerAccountID)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

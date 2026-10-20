@@ -52,6 +52,27 @@ func (r *SocialRepository) GetAllFollowers(ctx context.Context, VloggerID uint) 
 	return followers, nil
 }
 
+// ListFollowerIDsAfter 按粉丝 ID 游标分页查询粉丝，用于 Feed 写扩散。
+func (r *SocialRepository) ListFollowerIDsAfter(ctx context.Context, vloggerID uint, afterFollowerID uint, limit int) ([]uint, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var followerIDs []uint
+	query := r.db.WithContext(ctx).
+		Model(&Social{}).
+		Where("vlogger_id = ?", vloggerID)
+	if afterFollowerID > 0 {
+		query = query.Where("follower_id > ?", afterFollowerID)
+	}
+	if err := query.
+		Order("follower_id ASC").
+		Limit(limit).
+		Pluck("follower_id", &followerIDs).Error; err != nil {
+		return nil, err
+	}
+	return followerIDs, nil
+}
+
 func (r *SocialRepository) GetAllVloggers(ctx context.Context, FollowerID uint) ([]*account.Account, error) {
 	var relations []Social
 	if err := r.db.WithContext(ctx).

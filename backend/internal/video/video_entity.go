@@ -40,9 +40,12 @@ type UpdateLikesCountRequest struct {
 }
 
 type OutboxMsg struct {
-	ID         uint      `gorm:"primaryKey"`
-	VideoID    uint      `gorm:"index"`
-	EventType  string    `gorm:"type:varchar(50)"`
-	CreateTime time.Time `gorm:"autoCreateTime"`
-	Status     string    `gorm:"type:varchar(50);index"`
+	ID         uint       `gorm:"primaryKey"`
+	VideoID    uint       `gorm:"index"`
+	AuthorID   uint       `gorm:"index"`
+	EventType  string     `gorm:"type:varchar(50)"`
+	CreateTime time.Time  `gorm:"autoCreateTime"`
+	Status     string     `gorm:"type:varchar(50);index"`
+	RetryCount int        `gorm:"not null;default:0"`
+	NextRetry  *time.Time `gorm:"index"`
 }

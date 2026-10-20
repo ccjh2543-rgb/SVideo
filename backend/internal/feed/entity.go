@@ -30,15 +30,17 @@ type FeedVideoItem struct {
 // ListLatestRequest 获取最新视频流请求参数
 // 设计说明：用时间戳游标分页，不用offset，翻多少页都不慢
 type ListLatestRequest struct {
-	Limit      int   `json:"limit"`       // 每页返回多少条，一般10条
-	LatestTime int64 `json:"latest_time"` // 上一页最后一条的发布时间（游标，第一页传0）
+	Limit      int   `json:"limit"`               // 每页返回多少条，一般10条
+	LatestTime int64 `json:"latest_time"`         // 上一页最后一条的发布时间（游标，第一页传0）
+	LatestID   *uint `json:"latest_id,omitempty"` // 同毫秒发布的 ID 兜底游标
 }
 
 // ListLatestResponse 获取最新视频流返回结果
 type ListLatestResponse struct {
-	VideoList []FeedVideoItem `json:"video_list"` // 视频列表
-	NextTime  int64           `json:"next_time"`  // 下一页请求传这个值回去当游标
-	HasMore   bool            `json:"has_more"`   // 还有没有下一页
+	VideoList []FeedVideoItem `json:"video_list"`        // 视频列表
+	NextTime  int64           `json:"next_time"`         // 下一页请求传这个值回去当游标
+	NextID    *uint           `json:"next_id,omitempty"` // 同毫秒兜底游标
+	HasMore   bool            `json:"has_more"`          // 还有没有下一页
 }
 
 // -----------------------------------------------------------------------------

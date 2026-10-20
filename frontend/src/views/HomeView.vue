@@ -32,6 +32,7 @@ const recommend = reactive({
   error: '',
   hasMore: false,
   nextTime: 0,
+  nextId: undefined as number | undefined,
 })
 
 const hot = reactive({
@@ -155,9 +156,14 @@ async function loadRecommend(reset: boolean) {
   recommend.loading = true
   recommend.error = ''
   try {
-    const res = await feedApi.listLatest({ limit: 10, latest_time: reset ? 0 : recommend.nextTime })
+    const res = await feedApi.listLatest({
+      limit: 10,
+      latest_time: reset ? 0 : recommend.nextTime,
+      latest_id: reset ? undefined : recommend.nextId,
+    })
     recommend.hasMore = res.has_more
     recommend.nextTime = res.next_time
+    recommend.nextId = res.next_id
     recommend.items = reset ? res.video_list : recommend.items.concat(res.video_list)
   } catch (e) {
     recommend.error = e instanceof ApiError ? e.message : String(e)

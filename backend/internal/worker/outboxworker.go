@@ -53,7 +53,9 @@ func (p *OutboxPoller) Run(ctx context.Context) error {
 
 func (p *OutboxPoller) poll(ctx context.Context) {
 	var messages []video.OutboxMsg
+	now := time.Now()
 	err := p.db.Where("status = ?", "pending").
+		Where("next_retry IS NULL OR next_retry <= ?", now).
 		Order("create_time ASC").
 		Limit(100).
 		Find(&messages).Error
@@ -62,12 +64,23 @@ func (p *OutboxPoller) poll(ctx context.Context) {
 	}
 
 	for _, msg := range messages {
-		err := p.tmq.PublishVideo(context.Background(), msg.VideoID, msg.CreateTime)
+		err := p.tmq.PublishVideo(context.Background(), msg.VideoID, msg.AuthorID, msg.CreateTime)
 		if err == nil {
 			p.db.Delete(&msg)
-		} else {
-			log.Printf("投递MQ失败: VideoID: %d, err: %v", msg.VideoID, err)
+			continue
 		}
+
+		log.Printf("投递MQ失败: VideoID: %d, err: %v", msg.VideoID, err)
+		retryCount := msg.RetryCount + 1
+		updates := map[string]interface{}{"retry_count": retryCount}
+		if retryCount >= 3 {
+			// 超过最大重试次数，标记失败，等待人工处理。
+			updates["status"] = "failed"
+		} else {
+			// 指数退避：1s、2s、4s。
+			updates["next_retry"] = now.Add(time.Duration(1<<retryCount) * time.Second)
+		}
+		p.db.Model(&video.OutboxMsg{}).Where("id = ?", msg.ID).Updates(updates)
 	}
 }
 
@@ -134,7 +147,7 @@ func (c *TimelineConsumer) handleDelivery(ctx context.Context, msg amqp.Delivery
 	})
 	if err != nil {
 		log.Printf("写入Zset失败: %v", err)
-		_ = msg.Nack(false, true)
+		_ = msg.Nack(false, false)
 		return
 	}
 

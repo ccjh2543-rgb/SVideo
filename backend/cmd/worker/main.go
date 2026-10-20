@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	feedapp "feedsystem_video_go/internal/application/feed"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
+	timelineredis "feedsystem_video_go/internal/infrastructure/cache/redis"
+	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	"feedsystem_video_go/internal/interfaces/ws"
+	"feedsystem_video_go/internal/middleware/rabbitmq"
 	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/observability"
 	"feedsystem_video_go/internal/social"
@@ -21,19 +26,19 @@ import (
 
 const (
 	socialExchange   = "social.events"
-	socialQueue      = "social.events"
+	socialQueue      = rabbitmq.SocialQueueName
 	socialBindingKey = "social.*"
 
 	likeExchange   = "like.events"
-	likeQueue      = "like.events"
+	likeQueue      = rabbitmq.LikeQueueName
 	likeBindingKey = "like.*"
 
 	commentExchange   = "comment.events"
-	commentQueue      = "comment.events"
+	commentQueue      = rabbitmq.CommentQueueName
 	commentBindingKey = "comment.*"
 
 	popularityExchange   = "video.popularity.events"
-	popularityQueue      = "video.popularity.events"
+	popularityQueue      = rabbitmq.PopularityQueueName
 	popularityBindingKey = "video.popularity.*"
 )
 
@@ -159,6 +164,20 @@ func main() {
 	videoRepo := video.NewVideoRepository(sqlDB)
 	likeRepo := video.NewLikeRepository(sqlDB)
 	commentRepo := video.NewCommentRepository(sqlDB)
+	creatorRepo := accountmysql.NewCreatorStatsRepository(sqlDB)
+	processedEvents := accountmysql.NewProcessedEventRepository(sqlDB)
+	notifier := ws.NewRedisNotifier(cache, nil)
+
+	var fanoutService *feedapp.FanoutService
+	if cache != nil {
+		fanoutService = feedapp.NewFanoutService(
+			creatorRepo,
+			repo,
+			timelineredis.NewTimelineRepository(cache),
+			0,
+			500,
+		)
+	}
 
 	// ============================================================
 	// 6. 创建具体的 Worker（消费者）
@@ -168,17 +187,28 @@ func main() {
 	var likeWorker *worker.LikeWorker
 	var commentWorker *worker.CommentWorker
 	var popularityWorker *worker.PopularityWorker
+	var fanoutWorker *worker.FanoutWorker
 
 	// 只有当 RabbitMQ 通道（ch）不为 nil 时，才创建工作线程
 	// 队列名称（如 socialQueue）应当是在其他地方定义的常量，代表需要监听的队列名
 	if ch != nil {
-		socialWorker = worker.NewSocialWorker(ch, repo, socialQueue)
-		likeWorker = worker.NewLikeWorker(ch, likeRepo, videoRepo, likeQueue)
-		commentWorker = worker.NewCommentWorker(ch, commentRepo, videoRepo, commentQueue)
+		socialWorker = worker.NewSocialWorker(ch, repo, creatorRepo, processedEvents, notifier, socialQueue)
+		likeWorker = worker.NewLikeWorker(ch, likeRepo, videoRepo, processedEvents, notifier, likeQueue)
+		commentWorker = worker.NewCommentWorker(ch, commentRepo, videoRepo, processedEvents, notifier, commentQueue)
 
 		// PopularityWorker 仅在 Redis 客户端也有效时才创建
 		if cache != nil {
-			popularityWorker = worker.NewPopularityWorker(ch, cache, popularityQueue)
+			popularityWorker = worker.NewPopularityWorker(ch, cache, processedEvents, popularityQueue)
+		}
+
+		// 写扩散依赖 Redis，Redis 不可用时跳过。
+		if cache != nil && fanoutService != nil {
+			baseRMQ := &rabbitmq.RabbitMQ{Conn: conn, Ch: ch}
+			if _, err := rabbitmq.NewFanoutMQ(baseRMQ); err != nil {
+				log.Printf("Failed to declare fanout topology: %v", err)
+			} else {
+				fanoutWorker = worker.NewFanoutWorker(ch, fanoutService, processedEvents, rabbitmq.FanoutQueueName)
+			}
 		}
 	}
 
@@ -201,10 +231,10 @@ func main() {
 	defer pprofServer.Close()
 
 	// 错误通道，用于捕获各个 Worker 运行时的错误
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 6)
 	workerCount := 0 // 实际启动的 Worker 数量
 
-	// 依次开启 Social、Like、Comment、Popularity 四个 Worker 的 goroutine
+	// 依次开启 Social、Like、Comment、Popularity、Fanout 五个 Worker 的 goroutine
 	if socialWorker != nil {
 		log.Printf("Worker started, consuming queue=%s", socialQueue)
 		go func() { errCh <- socialWorker.Run(ctx) }()
@@ -223,6 +253,11 @@ func main() {
 	if popularityWorker != nil {
 		log.Printf("Worker started, consuming queue=%s", popularityQueue)
 		go func() { errCh <- popularityWorker.Run(ctx) }()
+		workerCount++
+	}
+	if fanoutWorker != nil {
+		log.Printf("Worker started, consuming queue=%s", rabbitmq.FanoutQueueName)
+		go func() { errCh <- fanoutWorker.Run(ctx) }()
 		workerCount++
 	}
 
@@ -247,140 +282,21 @@ func main() {
 	log.Printf("Worker stopped")
 }
 func declareSocialTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		socialExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		socialQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	if err := ch.QueueBind(
-		q.Name,
-		socialBindingKey,
-		socialExchange,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-	return nil
+	_, err := rabbitmq.NewSocialMQ(&rabbitmq.RabbitMQ{Ch: ch})
+	return err
 }
 
 func declarePopularityTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		popularityExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		popularityQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		popularityBindingKey,
-		popularityExchange,
-		false,
-		nil,
-	)
+	_, err := rabbitmq.NewPopularityMQ(&rabbitmq.RabbitMQ{Ch: ch})
+	return err
 }
 
 func declareLikeTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		likeExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		likeQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		likeBindingKey,
-		likeExchange,
-		false,
-		nil,
-	)
+	_, err := rabbitmq.NewLikeMQ(&rabbitmq.RabbitMQ{Ch: ch})
+	return err
 }
 
 func declareCommentTopology(ch *amqp.Channel) error {
-	if err := ch.ExchangeDeclare(
-		commentExchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(
-		commentQueue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	return ch.QueueBind(
-		q.Name,
-		commentBindingKey,
-		commentExchange,
-		false,
-		nil,
-	)
+	_, err := rabbitmq.NewCommentMQ(&rabbitmq.RabbitMQ{Ch: ch})
+	return err
 }

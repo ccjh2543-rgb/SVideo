@@ -1,7 +1,7 @@
 import { postJson } from './client'
 import type { ListByFollowingResponse, ListByPopularityResponse, ListLatestResponse, ListLikesCountResponse } from './types'
 
-export function listLatest(input: { limit: number; latest_time: number }) {
+export function listLatest(input: { limit: number; latest_time: number; latest_id?: number }) {
   return postJson<ListLatestResponse>('/feed/listLatest', input)
 }
 

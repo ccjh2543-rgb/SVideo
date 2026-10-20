@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { useAuthStore } from '../stores/auth'
+import { useNotificationStore } from '../stores/notifications'
 import { useSocialStore } from '../stores/social'
 import Toaster from './Toaster.vue'
 
@@ -10,6 +11,7 @@ const props = defineProps<{ full?: boolean }>()
 
 const auth = useAuthStore()
 const social = useSocialStore()
+const notifications = useNotificationStore()
 const router = useRouter()
 const route = useRoute()
 
@@ -26,6 +28,15 @@ watch(
   (v) => {
     if (v) void social.refreshMine()
     else social.clear()
+  },
+  { immediate: true },
+)
+
+watch(
+  () => [auth.isLoggedIn, auth.token] as const,
+  ([loggedIn, token]) => {
+    if (loggedIn && token) notifications.connect(token)
+    else notifications.disconnect()
   },
   { immediate: true },
 )

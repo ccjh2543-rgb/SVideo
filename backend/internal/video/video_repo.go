@@ -65,6 +65,22 @@ func (vr *VideoRepository) UpdateLikesCount(ctx context.Context, id uint, likesC
 	return nil
 }
 
+// ListIDsAfter 按主键游标分页查询视频 ID，用于重建布隆过滤器。
+func (vr *VideoRepository) ListIDsAfter(ctx context.Context, afterID uint, limit int) ([]uint, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	var ids []uint
+	query := vr.db.WithContext(ctx).Model(&Video{})
+	if afterID > 0 {
+		query = query.Where("id > ?", afterID)
+	}
+	if err := query.Order("id ASC").Limit(limit).Pluck("id", &ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 func (vr *VideoRepository) IsExist(ctx context.Context, id uint) (bool, error) {
 	var video Video
 	if err := vr.db.WithContext(ctx).First(&video, id).Error; err != nil {

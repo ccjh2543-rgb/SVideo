@@ -42,6 +42,14 @@ func IsMiss(err error) bool {
 	return err == redis.Nil
 }
 
+// SetNX 仅当 key 不存在时写入，用于接口幂等键。
+func (c *Client) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	if c == nil || c.rdb == nil {
+		return true, nil
+	}
+	return c.rdb.SetNX(ctx, key, value, ttl).Result()
+}
+
 func (c *Client) Lock(ctx context.Context, key string, ttl time.Duration) (token string, ok bool, err error) {
 	if c == nil || c.rdb == nil {
 		return "", false, nil

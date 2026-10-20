@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"feedsystem_video_go/internal/domain/creator"
+	domainnotification "feedsystem_video_go/internal/domain/notification"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/util"
@@ -15,15 +17,24 @@ import (
 // SocialWorker 是处理社交关系（关注/取关）的消费者 Worker。
 // 它从 RabbitMQ 指定队列中消费 SocialEvent 消息，并调用 SocialRepository 持久化关系。
 type SocialWorker struct {
-	ch    *amqp.Channel            // AMQP 通道，用于消费消息
-	repo  *social.SocialRepository // 社交关系数据仓库，封装数据库操作
-	queue string                   // 要监听的队列名称
+	ch       *amqp.Channel
+	repo     *social.SocialRepository
+	creators creator.Repository
+	events   EventIdempotency
+	notifier domainnotification.Notifier
+	queue    string
 }
 
 // NewSocialWorker 创建 SocialWorker 实例。
-// 参数 ch 是已建立的 AMQP 通道，repo 是持久化层，queue 是消费的队列名。
-func NewSocialWorker(ch *amqp.Channel, repo *social.SocialRepository, queue string) *SocialWorker {
-	return &SocialWorker{ch: ch, repo: repo, queue: queue}
+func NewSocialWorker(
+	ch *amqp.Channel,
+	repo *social.SocialRepository,
+	creators creator.Repository,
+	events EventIdempotency,
+	notifier domainnotification.Notifier,
+	queue string,
+) *SocialWorker {
+	return &SocialWorker{ch: ch, repo: repo, creators: creators, events: events, notifier: notifier, queue: queue}
 }
 
 // Run 启动 Worker，开始消费消息并处理，直到 ctx 被取消或发生不可恢复的错误。
@@ -74,11 +85,9 @@ func (w *SocialWorker) Run(ctx context.Context) error {
 func (w *SocialWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	// 调用核心业务逻辑处理消息体
 	if err := w.process(ctx, d.Body); err != nil {
-		// 处理失败，记录日志，并通过 Nack 将消息重新入队以待重试
+		// 处理失败，记录日志并投递到死信队列，避免无限重试。
 		log.Printf("social worker: failed to process message: %v", err)
-		// d.Nack(false, true)：第一个 false 表示不批量拒绝，仅针对当前消息；
-		// 第二个 true 表示 requeue，让消息重新回到队列尾部，稍后重新投递。
-		_ = d.Nack(false, true)
+		_ = d.Nack(false, false)
 		return
 	}
 	// 处理成功，发送 Ack 确认消息，从队列中移除
@@ -97,6 +106,15 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 	if evt.FollowerID == 0 || evt.VloggerID == 0 {
 		return nil
 	}
+	if w.events != nil {
+		first, err := w.events.TryMark(ctx, "social", evt.EventID)
+		if err != nil {
+			return err
+		}
+		if !first {
+			return nil
+		}
+	}
 
 	// 根据事件中的 Action 字段分发业务逻辑
 	switch evt.Action {
@@ -107,7 +125,23 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 			VloggerID:  evt.VloggerID,
 		})
 		if err == nil {
-			return nil // 成功
+			// 只有真正新增关注关系时才增加粉丝数，重复消息不会重复计数。
+			if w.creators != nil {
+				if err := w.creators.IncrementFans(ctx, evt.VloggerID, 1); err != nil {
+					return err
+				}
+			}
+			if w.notifier != nil {
+				_ = w.notifier.Publish(ctx, domainnotification.Event{
+					EventID:   evt.EventID,
+					AccountID: evt.VloggerID,
+					Type:      "follow",
+					Title:     "有新的粉丝",
+					Body:      "有人关注了你",
+					Data:      map[string]any{"follower_id": evt.FollowerID},
+				})
+			}
+			return nil
 		}
 		// 处理 MySQL 重复键错误（Error 1062: Duplicate entry）
 		// 关注关系存在是幂等场景，不应视为错误，直接忽略
@@ -118,11 +152,17 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 		return err
 
 	case "unfollow":
-		// 尝试删除关注关系，直接返回删除操作的结果（即使关系不存在，删除也可视为成功，取决于 Repo 实现）
-		return w.repo.Unfollow(ctx, &social.Social{
+		// 尝试删除关注关系，删除成功后减少粉丝数。
+		if err := w.repo.Unfollow(ctx, &social.Social{
 			FollowerID: evt.FollowerID,
 			VloggerID:  evt.VloggerID,
-		})
+		}); err != nil {
+			return err
+		}
+		if w.creators != nil {
+			return w.creators.IncrementFans(ctx, evt.VloggerID, -1)
+		}
+		return nil
 
 	default:
 		// 未知动作类型，丢弃消息不处理，不重试

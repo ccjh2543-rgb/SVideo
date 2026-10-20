@@ -13,8 +13,10 @@ type CommentMQ struct {
 
 const (
 	commentExchange   = "comment.events"
-	commentQueue      = "comment.events"
+	CommentQueueName  = "comment.events.v2"
 	commentBindingKey = "comment.*"
+	commentDLX        = "comment.events.dlx"
+	CommentDLQName    = "comment.events.dlq"
 
 	commentPublishRK = "comment.publish"
 	commentDeleteRK  = "comment.delete"
@@ -35,7 +37,7 @@ func NewCommentMQ(base *RabbitMQ) (*CommentMQ, error) {
 	if base == nil {
 		return nil, errors.New("rabbitmq base is nil")
 	}
-	if err := base.DeclareTopic(commentExchange, commentQueue, commentBindingKey); err != nil {
+	if err := base.DeclareTopicWithDLQ(commentExchange, CommentQueueName, commentBindingKey, commentDLX, CommentDLQName, "#"); err != nil {
 		return nil, err
 	}
 	return &CommentMQ{RabbitMQ: base}, nil

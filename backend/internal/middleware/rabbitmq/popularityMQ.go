@@ -13,8 +13,10 @@ type PopularityMQ struct {
 
 const (
 	popularityExchange   = "video.popularity.events"
-	popularityQueue      = "video.popularity.events"
+	PopularityQueueName  = "video.popularity.events.v2"
 	popularityBindingKey = "video.popularity.*"
+	popularityDLX        = "video.popularity.events.dlx"
+	PopularityDLQName    = "video.popularity.events.dlq"
 
 	popularityUpdateRK = "video.popularity.update"
 )
@@ -30,7 +32,14 @@ func NewPopularityMQ(base *RabbitMQ) (*PopularityMQ, error) {
 	if base == nil {
 		return nil, errors.New("rabbitmq base is nil")
 	}
-	if err := base.DeclareTopic(popularityExchange, popularityQueue, popularityBindingKey); err != nil {
+	if err := base.DeclareTopicWithDLQ(
+		popularityExchange,
+		PopularityQueueName,
+		popularityBindingKey,
+		popularityDLX,
+		PopularityDLQName,
+		"#",
+	); err != nil {
 		return nil, err
 	}
 	return &PopularityMQ{RabbitMQ: base}, nil

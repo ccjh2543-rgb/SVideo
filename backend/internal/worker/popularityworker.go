@@ -13,13 +13,14 @@ import (
 )
 
 type PopularityWorker struct {
-	ch    *amqp.Channel
-	cache *rediscache.Client
-	queue string
+	ch     *amqp.Channel
+	cache  *rediscache.Client
+	events EventIdempotency
+	queue  string
 }
 
-func NewPopularityWorker(ch *amqp.Channel, cache *rediscache.Client, queue string) *PopularityWorker {
-	return &PopularityWorker{ch: ch, cache: cache, queue: queue}
+func NewPopularityWorker(ch *amqp.Channel, cache *rediscache.Client, events EventIdempotency, queue string) *PopularityWorker {
+	return &PopularityWorker{ch: ch, cache: cache, events: events, queue: queue}
 }
 
 func (w *PopularityWorker) Run(ctx context.Context) error {
@@ -59,7 +60,7 @@ func (w *PopularityWorker) Run(ctx context.Context) error {
 func (w *PopularityWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	if err := w.process(ctx, d.Body); err != nil {
 		log.Printf("popularity worker: failed to process message: %v", err)
-		_ = d.Nack(false, true)
+		_ = d.Nack(false, false)
 		return
 	}
 	_ = d.Ack(false)
@@ -72,6 +73,15 @@ func (w *PopularityWorker) process(ctx context.Context, body []byte) error {
 	}
 	if evt.VideoID == 0 || evt.Change == 0 {
 		return nil
+	}
+	if w.events != nil {
+		first, err := w.events.TryMark(ctx, "popularity", evt.EventID)
+		if err != nil {
+			return err
+		}
+		if !first {
+			return nil
+		}
 	}
 	video.UpdatePopularityCache(ctx, w.cache, evt.VideoID, evt.Change)
 	return nil

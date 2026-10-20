@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	domainnotification "feedsystem_video_go/internal/domain/notification"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/video"
 	"log"
@@ -16,11 +17,20 @@ type CommentWorker struct {
 	ch       *amqp.Channel
 	comments *video.CommentRepository
 	videos   *video.VideoRepository
+	events   EventIdempotency
+	notifier domainnotification.Notifier
 	queue    string
 }
 
-func NewCommentWorker(ch *amqp.Channel, comments *video.CommentRepository, videos *video.VideoRepository, queue string) *CommentWorker {
-	return &CommentWorker{ch: ch, comments: comments, videos: videos, queue: queue}
+func NewCommentWorker(
+	ch *amqp.Channel,
+	comments *video.CommentRepository,
+	videos *video.VideoRepository,
+	events EventIdempotency,
+	notifier domainnotification.Notifier,
+	queue string,
+) *CommentWorker {
+	return &CommentWorker{ch: ch, comments: comments, videos: videos, events: events, notifier: notifier, queue: queue}
 }
 
 func (w *CommentWorker) Run(ctx context.Context) error {
@@ -60,7 +70,7 @@ func (w *CommentWorker) Run(ctx context.Context) error {
 func (w *CommentWorker) handleDelivery(ctx context.Context, d amqp.Delivery) {
 	if err := w.process(ctx, d.Body); err != nil {
 		log.Printf("comment worker: failed to process message: %v", err)
-		_ = d.Nack(false, true)
+		_ = d.Nack(false, false)
 		return
 	}
 	_ = d.Ack(false)
@@ -70,6 +80,15 @@ func (w *CommentWorker) process(ctx context.Context, body []byte) error {
 	var evt rabbitmq.CommentEvent
 	if err := json.Unmarshal(body, &evt); err != nil {
 		return nil
+	}
+	if w.events != nil {
+		first, err := w.events.TryMark(ctx, "comment", evt.EventID)
+		if err != nil {
+			return err
+		}
+		if !first {
+			return nil
+		}
 	}
 	switch evt.Action {
 	case "publish":
@@ -103,7 +122,24 @@ func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentE
 	if err := w.comments.CreateComment(ctx, c); err != nil {
 		return err
 	}
-	return w.videos.ChangePopularity(ctx, evt.VideoID, 1)
+	if err := w.videos.ChangePopularity(ctx, evt.VideoID, 1); err != nil {
+		return err
+	}
+
+	if w.notifier != nil {
+		item, err := w.videos.GetByID(ctx, evt.VideoID)
+		if err == nil && item != nil && item.AuthorID != evt.AuthorID {
+			_ = w.notifier.Publish(ctx, domainnotification.Event{
+				EventID:   evt.EventID,
+				AccountID: item.AuthorID,
+				Type:      "comment",
+				Title:     "收到新的评论",
+				Body:      strings.TrimSpace(evt.Content),
+				Data:      map[string]any{"video_id": evt.VideoID, "from_account_id": evt.AuthorID},
+			})
+		}
+	}
+	return nil
 }
 
 func (w *CommentWorker) applyDelete(ctx context.Context, evt *rabbitmq.CommentEvent) error {
