@@ -20,9 +20,9 @@ import (
 
 	domaincreator "feedsystem_video_go/internal/domain/creator"
 	domainfeed "feedsystem_video_go/internal/domain/feed"
+	domainvideo "feedsystem_video_go/internal/domain/video"
 	cachelib "feedsystem_video_go/internal/infrastructure/cache"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
-	"feedsystem_video_go/internal/video"
 	"fmt"
 	"log"
 	"strconv"
@@ -38,7 +38,7 @@ import (
 // 这是整个系统技术含量最高的地方
 type FeedService struct {
 	repo         *FeedRepository // L3 MySQL查询
-	likeRepo     *video.LikeRepository
+	likeRepo     domainvideo.LikeRepository
 	rediscache   *rediscache.Client // L2 分布式缓存
 	localcache   *cache.Cache       // L1 本地内存缓存（3秒）
 	timelineRepo domainfeed.TimelineRepository
@@ -48,13 +48,13 @@ type FeedService struct {
 
 // CachedFeedData Redis中缓存的视频流数据结构
 type CachedFeedData struct {
-	PublicVideos []video.Video `json:"public_videos"`
+	PublicVideos []domainvideo.Video `json:"public_videos"`
 }
 
 // NewFeedService 创建Feed流服务（依赖注入）
 func NewFeedService(
 	repo *FeedRepository,
-	likeRepo *video.LikeRepository,
+	likeRepo domainvideo.LikeRepository,
 	rediscache *rediscache.Client,
 	timelineRepo domainfeed.TimelineRepository,
 	creatorRepo domaincreator.Repository,
@@ -87,12 +87,12 @@ func NewFeedService(
 
 // GetVideoByIDs 批量获取视频详情（三级缓存 + SingleFlight防击穿）
 // 这是整个Feed流的性能基石
-func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*video.Video, error) {
+func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*domainvideo.Video, error) {
 	if len(videoIDs) == 0 {
-		return []*video.Video{}, nil
+		return []*domainvideo.Video{}, nil
 	}
 
-	videoMap := make(map[uint]*video.Video)
+	videoMap := make(map[uint]*domainvideo.Video)
 
 	// =========================================================================
 	// 【第一级】 L1 本地内存缓存（3秒 TTL）
@@ -103,7 +103,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 		cacheKey := fmt.Sprintf("video:entity:%d", id)
 		if f.localcache != nil {
 			if v, found := f.localcache.Get(cacheKey); found {
-				if data, ok := v.(video.Video); ok {
+				if data, ok := v.(domainvideo.Video); ok {
 					videoMap[id] = &data
 					continue // ✅ L1命中，拿下一个
 				}
@@ -139,7 +139,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 				id := missedL1[i]
 				if res != nil {
 					if str, ok := res.(string); ok {
-						var v video.Video
+						var v domainvideo.Video
 						if err := json.Unmarshal([]byte(str), &v); err == nil {
 							videoMap[id] = &v
 							// ✅ 命中Redis，顺便回填L1本地缓存
@@ -205,7 +205,7 @@ func (f *FeedService) GetVideoByIDs(ctx context.Context, videoIDs []uint) ([]*vi
 
 			// 查到了，回填L1本地缓存
 			if err == nil && v != nil {
-				safeCopy := *(v.(*video.Video))
+				safeCopy := *(v.(*domainvideo.Video))
 				mu.Lock()
 				videoMap[videoID] = &safeCopy
 				mu.Unlock()
@@ -291,7 +291,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 		reqTime = latestBefore.UnixMilli()
 	}
 
-	var baseVideos []*video.Video
+	var baseVideos []*domainvideo.Video
 
 	// ========== 第三步：根据请求时间与分界线的关系选择数据源 ==========
 	if reqTime <= watermark {
@@ -304,7 +304,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 		if err != nil {
 			return ListLatestResponse{}, err
 		}
-		baseVideos = v.([]*video.Video)
+		baseVideos = v.([]*domainvideo.Video)
 		// 注意：这里不回写 ZSET，防止冷数据污染热点时间线（避免将很旧的视频刷入缓存）。
 
 	} else {
@@ -341,7 +341,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 		// 同一毫秒兜底游标：时间相同则按 ID 继续倒序。
 		if !latestBefore.IsZero() {
 			cursorMs := latestBefore.UnixMilli()
-			filtered := make([]*video.Video, 0, len(baseVideos))
+			filtered := make([]*domainvideo.Video, 0, len(baseVideos))
 			for _, item := range baseVideos {
 				itemMs := item.CreateTime.UnixMilli()
 				if itemMs < cursorMs || (itemMs == cursorMs && (latestID == 0 || item.ID < latestID)) {
@@ -379,7 +379,7 @@ func (f *FeedService) ListLatest(ctx context.Context, limit int, latestBefore ti
 			})
 
 			if err == nil {
-				coldVideos := v.([]*video.Video)
+				coldVideos := v.([]*domainvideo.Video)
 				// 将冷数据拼接到热数据后面
 				baseVideos = append(baseVideos, coldVideos...)
 			}
@@ -665,11 +665,11 @@ func (f *FeedService) ListByPopularity(ctx context.Context, limit int, reqAsOf i
 			videos, err := f.repo.GetByIDs(ctx, ids)
 			if err == nil {
 				// 构建ID到视频的映射，并按 Redis 返回的顺序排列结果
-				byID := make(map[uint]*video.Video, len(videos))
+				byID := make(map[uint]*domainvideo.Video, len(videos))
 				for _, v := range videos {
 					byID[v.ID] = v
 				}
-				ordered := make([]*video.Video, 0, len(ids))
+				ordered := make([]*domainvideo.Video, 0, len(ids))
 				for _, id := range ids {
 					if v := byID[id]; v != nil {
 						ordered = append(ordered, v)
@@ -759,7 +759,7 @@ func linearDecayWeights(hours int) []float64 {
 
 // buildFeedVideos 根据视频实体列表构建前端使用的 FeedVideoItem 列表，
 // 会批量查询当前用户是否点赞了这些视频，并填充点赞数等信息。
-func (f *FeedService) buildFeedVideos(ctx context.Context, videos []*video.Video, viewerAccountID uint) ([]FeedVideoItem, error) {
+func (f *FeedService) buildFeedVideos(ctx context.Context, videos []*domainvideo.Video, viewerAccountID uint) ([]FeedVideoItem, error) {
 	feedVideos := make([]FeedVideoItem, 0, len(videos))
 
 	// 收集所有视频的ID，用于批量查询点赞状态
@@ -793,8 +793,8 @@ func (f *FeedService) buildFeedVideos(ctx context.Context, videos []*video.Video
 
 // buildOrderedResult 按照 orderedIDs 的顺序从 dataMap 中提取视频实体，
 // 确保结果顺序与给定的ID列表一致，忽略在 map 中不存在的ID。
-func buildOrderedResult(orderedIDs []uint, dataMap map[uint]*video.Video) []*video.Video {
-	res := make([]*video.Video, 0, len(orderedIDs))
+func buildOrderedResult(orderedIDs []uint, dataMap map[uint]*domainvideo.Video) []*domainvideo.Video {
+	res := make([]*domainvideo.Video, 0, len(orderedIDs))
 	for _, id := range orderedIDs {
 		if v, exits := dataMap[id]; exits && v != nil {
 			res = append(res, v)

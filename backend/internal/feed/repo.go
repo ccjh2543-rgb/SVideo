@@ -8,8 +8,8 @@ package feed
 
 import (
 	"context"
+	domainvideo "feedsystem_video_go/internal/domain/video"
 	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
 	"time"
 
 	"gorm.io/gorm"
@@ -49,15 +49,15 @@ func NewFeedRepository(db *gorm.DB) *FeedRepository {
 //	非第一页：传入上一页最后一条的create_time
 //
 // 返回值：视频列表指针切片、查询错误
-func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time, latestID uint) ([]*video.Video, error) {
+func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBefore time.Time, latestID uint) ([]*domainvideo.Video, error) {
 	// 定义视频切片，用于接收数据库查询结果
-	var videos []*video.Video
+	var videos []*domainvideo.Video
 
 	// ===================== 第一步：构建基础查询语句 =====================
 	// GORM查询构造器
 	// 等价SQL基础部分：SELECT * FROM video ORDER BY create_time DESC
 	// 作用：指定查询video表，按【创建时间倒序】排序（最新发布的排在最前面）
-	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+	query := repo.db.WithContext(ctx).Model(&domainvideo.Video{}).
 		Order("create_time DESC")
 
 	// ===================== 第二步：处理时间游标（核心分页逻辑） =====================
@@ -98,11 +98,11 @@ func (repo *FeedRepository) ListLatest(ctx context.Context, limit int, latestBef
 // ListLikesCountWithCursor 按点赞数倒序查视频
 // 设计亮点：双字段游标解决同分问题
 // 数据流：传(上一页最后一条的点赞数, 视频ID) → 精确查询不重复不遗漏
-func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit int, cursor *LikesCountCursor) ([]*video.Video, error) {
-	var videos []*video.Video
+func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit int, cursor *LikesCountCursor) ([]*domainvideo.Video, error) {
+	var videos []*domainvideo.Video
 
 	// 排序规则：先按点赞数降序，点赞数相同就按ID降序
-	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+	query := repo.db.WithContext(ctx).Model(&domainvideo.Video{}).
 		Order("likes_count DESC, id DESC")
 
 	if cursor != nil {
@@ -132,10 +132,10 @@ func (repo *FeedRepository) ListLikesCountWithCursor(ctx context.Context, limit 
 
 // ListByFollowing 查询我关注的博主发布的视频
 // 设计亮点：子查询代替JOIN，性能提升一个数量级
-func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, latestBefore time.Time) ([]*video.Video, error) {
-	var videos []*video.Video
+func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, viewerAccountID uint, latestBefore time.Time) ([]*domainvideo.Video, error) {
+	var videos []*domainvideo.Video
 
-	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+	query := repo.db.WithContext(ctx).Model(&domainvideo.Video{}).
 		Order("create_time DESC")
 
 	if viewerAccountID > 0 {
@@ -168,11 +168,11 @@ func (repo *FeedRepository) ListByFollowing(ctx context.Context, limit int, view
 
 // ListByPopularity 按算法热度倒序查询（推荐流降级方案）
 // 设计：三字段游标保证海量数据下分页绝对准确
-func (repo *FeedRepository) ListByPopularity(ctx context.Context, limit int, popularityBefore int64, timeBefore time.Time, idBefore uint) ([]*video.Video, error) {
-	var videos []*video.Video
+func (repo *FeedRepository) ListByPopularity(ctx context.Context, limit int, popularityBefore int64, timeBefore time.Time, idBefore uint) ([]*domainvideo.Video, error) {
+	var videos []*domainvideo.Video
 
 	// 三级排序规则：热度 > 发布时间 > ID
-	query := repo.db.WithContext(ctx).Model(&video.Video{}).
+	query := repo.db.WithContext(ctx).Model(&domainvideo.Video{}).
 		Order("popularity DESC, create_time DESC, id DESC")
 
 	// Redis挂了才会走到这里，这就是降级方案的SQL
@@ -199,12 +199,12 @@ func (repo *FeedRepository) ListByPopularity(ctx context.Context, limit int, pop
 
 // GetByIDs 批量根据视频ID查详情
 // 数据流：Service传ID数组 → MySQL IN查询 → 返回给Service回填缓存
-func (repo *FeedRepository) GetByIDs(ctx context.Context, ids []uint) ([]*video.Video, error) {
-	var videos []*video.Video
+func (repo *FeedRepository) GetByIDs(ctx context.Context, ids []uint) ([]*domainvideo.Video, error) {
+	var videos []*domainvideo.Video
 	if len(ids) == 0 {
 		return videos, nil
 	}
-	if err := repo.db.WithContext(ctx).Model(&video.Video{}).
+	if err := repo.db.WithContext(ctx).Model(&domainvideo.Video{}).
 		Where("id IN ?", ids).Find(&videos).Error; err != nil {
 		return nil, err
 	}

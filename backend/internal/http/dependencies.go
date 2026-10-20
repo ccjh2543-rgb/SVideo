@@ -5,9 +5,9 @@ import (
 	"feedsystem_video_go/internal/feed"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
 )
 
 // Dependencies HTTP 层依赖集合。
@@ -15,9 +15,9 @@ import (
 // Router 只负责注册路由，不再承担对象构造职责。
 type Dependencies struct {
 	AccountHandler *httpaccount.Handler
-	VideoHandler   *video.VideoHandler
-	LikeHandler    *video.LikeHandler
-	CommentHandler *video.CommentHandler
+	VideoHandler   *httpvideo.VideoHandler
+	LikeHandler    *httpvideo.LikeHandler
+	CommentHandler *httpvideo.CommentHandler
 	SocialHandler  *social.SocialHandler
 	FeedHandler    *feed.FeedHandler
 	WSHandler      *ws.Handler

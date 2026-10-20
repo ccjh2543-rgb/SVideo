@@ -3,29 +3,28 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"feedsystem_video_go/internal/domain/video"
 	"feedsystem_video_go/internal/infrastructure/cache/redis"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
-	"feedsystem_video_go/internal/video"
 	"fmt"
 	"log"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	oredis "github.com/redis/go-redis/v9"
-	"gorm.io/gorm"
 )
 
 // OutboxPoller 定期轮询本地消息表（outbox），将 pending 状态的消息投递到 MQ。
 type OutboxPoller struct {
-	db       *gorm.DB
+	outbox   video.OutboxRepository
 	tmq      *rabbitmq.TimelineMQ
 	interval time.Duration
 }
 
 // NewOutboxPoller 创建 OutboxPoller 实例。
-func NewOutboxPoller(db *gorm.DB, tmq *rabbitmq.TimelineMQ) *OutboxPoller {
+func NewOutboxPoller(outbox video.OutboxRepository, tmq *rabbitmq.TimelineMQ) *OutboxPoller {
 	return &OutboxPoller{
-		db:       db,
+		outbox:   outbox,
 		tmq:      tmq,
 		interval: 1 * time.Second,
 	}
@@ -52,13 +51,8 @@ func (p *OutboxPoller) Run(ctx context.Context) error {
 }
 
 func (p *OutboxPoller) poll(ctx context.Context) {
-	var messages []video.OutboxMsg
 	now := time.Now()
-	err := p.db.Where("status = ?", "pending").
-		Where("next_retry IS NULL OR next_retry <= ?", now).
-		Order("create_time ASC").
-		Limit(100).
-		Find(&messages).Error
+	messages, err := p.outbox.ListPending(ctx, now, 100)
 	if err != nil || len(messages) == 0 {
 		return
 	}
@@ -66,21 +60,18 @@ func (p *OutboxPoller) poll(ctx context.Context) {
 	for _, msg := range messages {
 		err := p.tmq.PublishVideo(context.Background(), msg.VideoID, msg.AuthorID, msg.CreateTime)
 		if err == nil {
-			p.db.Delete(&msg)
+			_ = p.outbox.Delete(ctx, msg.ID)
 			continue
 		}
 
 		log.Printf("投递MQ失败: VideoID: %d, err: %v", msg.VideoID, err)
 		retryCount := msg.RetryCount + 1
-		updates := map[string]interface{}{"retry_count": retryCount}
 		if retryCount >= 3 {
-			// 超过最大重试次数，标记失败，等待人工处理。
-			updates["status"] = "failed"
+			_ = p.outbox.MarkRetry(ctx, msg.ID, retryCount, "failed", nil)
 		} else {
-			// 指数退避：1s、2s、4s。
-			updates["next_retry"] = now.Add(time.Duration(1<<retryCount) * time.Second)
+			next := now.Add(time.Duration(1<<retryCount) * time.Second)
+			_ = p.outbox.MarkRetry(ctx, msg.ID, retryCount, "pending", &next)
 		}
-		p.db.Model(&video.OutboxMsg{}).Where("id = ?", msg.ID).Updates(updates)
 	}
 }
 
@@ -157,10 +148,9 @@ func (c *TimelineConsumer) handleDelivery(ctx context.Context, msg amqp.Delivery
 	_ = msg.Ack(false)
 }
 
-// 保留旧版函数以保持向后兼容，内部转换为新 API。
-// Deprecated: 使用 NewOutboxPoller 和 Run 方法替代。
-func StartOutboxPoller(db *gorm.DB, tmq *rabbitmq.TimelineMQ) {
-	poller := NewOutboxPoller(db, tmq)
+// StartOutboxPoller 启动 Outbox 轮询器。
+func StartOutboxPoller(outbox video.OutboxRepository, tmq *rabbitmq.TimelineMQ) {
+	poller := NewOutboxPoller(outbox, tmq)
 	go func() {
 		_ = poller.Run(context.Background())
 	}()

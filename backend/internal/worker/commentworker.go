@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	domainnotification "feedsystem_video_go/internal/domain/notification"
+	domainvideo "feedsystem_video_go/internal/domain/video"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
-	"feedsystem_video_go/internal/video"
 	"log"
 	"strings"
 
@@ -15,8 +15,8 @@ import (
 
 type CommentWorker struct {
 	ch       *amqp.Channel
-	comments *video.CommentRepository
-	videos   *video.VideoRepository
+	comments domainvideo.CommentRepository
+	videos   domainvideo.VideoRepository
 	events   EventIdempotency
 	notifier domainnotification.Notifier
 	queue    string
@@ -24,8 +24,8 @@ type CommentWorker struct {
 
 func NewCommentWorker(
 	ch *amqp.Channel,
-	comments *video.CommentRepository,
-	videos *video.VideoRepository,
+	comments domainvideo.CommentRepository,
+	videos domainvideo.VideoRepository,
 	events EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
@@ -113,13 +113,13 @@ func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentE
 		return nil
 	}
 
-	c := &video.Comment{
+	c := &domainvideo.Comment{
 		Username: strings.TrimSpace(evt.Username),
 		VideoID:  evt.VideoID,
 		AuthorID: evt.AuthorID,
 		Content:  strings.TrimSpace(evt.Content),
 	}
-	if err := w.comments.CreateComment(ctx, c); err != nil {
+	if err := w.comments.Create(ctx, c); err != nil {
 		return err
 	}
 	if err := w.videos.ChangePopularity(ctx, evt.VideoID, 1); err != nil {
@@ -153,5 +153,5 @@ func (w *CommentWorker) applyDelete(ctx context.Context, evt *rabbitmq.CommentEv
 	if c == nil {
 		return nil
 	}
-	return w.comments.DeleteComment(ctx, c)
+	return w.comments.Delete(ctx, c)
 }

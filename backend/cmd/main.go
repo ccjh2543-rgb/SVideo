@@ -8,21 +8,23 @@ import (
 	"time"
 
 	appaccount "feedsystem_video_go/internal/application/account"
+	appvideo "feedsystem_video_go/internal/application/video"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
 	"feedsystem_video_go/internal/feed"
 	apphttp "feedsystem_video_go/internal/http"
 	cachelib "feedsystem_video_go/internal/infrastructure/cache"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
-	timelineredis "feedsystem_video_go/internal/infrastructure/cache/redis"
+	videocache "feedsystem_video_go/internal/infrastructure/cache/redis/video"
 	rabbitmq "feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/infrastructure/security"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
 	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
 	"feedsystem_video_go/internal/worker"
 )
 
@@ -118,7 +120,7 @@ func main() {
 	// ============================================================
 	// 组合根：视频、点赞、评论
 	// ============================================================
-	videoRepository := video.NewVideoRepository(sqlDB)
+	videoRepository := videomysql.NewVideoRepository(sqlDB)
 	popularityMQ, err := rabbitmq.NewPopularityMQ(rmq)
 	if err != nil {
 		log.Printf("PopularityMQ init failed (mq disabled): %v", err)
@@ -126,7 +128,8 @@ func main() {
 	}
 
 	bloom := cachelib.NewBloomFilter(cache, "bloom:video_ids", 0, 0)
-	videoService := video.NewVideoService(videoRepository, cache, popularityMQ, bloom)
+	detailCache := videocache.NewDetailCache(cache, bloom)
+	videoService := appvideo.NewVideoService(videoRepository, detailCache)
 	if cache != nil {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -136,25 +139,38 @@ func main() {
 			}
 		}()
 	}
-	videoHandler := video.NewVideoHandler(videoService)
+	videoHandler := httpvideo.NewVideoHandler(videoService)
 
 	likeMQ, err := rabbitmq.NewLikeMQ(rmq)
 	if err != nil {
 		log.Printf("LikeMQ init failed (mq disabled): %v", err)
 		likeMQ = nil
 	}
-	likeRepository := video.NewLikeRepository(sqlDB)
-	likeService := video.NewLikeService(likeRepository, videoRepository, cache, likeMQ, popularityMQ)
-	likeHandler := video.NewLikeHandler(likeService)
+	likeRepository := videomysql.NewLikeRepository(sqlDB)
+	var likePublisher appvideo.LikeEventPublisher
+	if likeMQ != nil {
+		likePublisher = likeMQ
+	}
+	var popularityPublisher appvideo.PopularityUpdater
+	if popularityMQ != nil {
+		popularityPublisher = popularityMQ
+	}
+	popularityCache := videocache.NewPopularityCache(cache)
+	likeService := appvideo.NewLikeService(likeRepository, videoRepository, likePublisher, popularityPublisher, popularityCache)
+	likeHandler := httpvideo.NewLikeHandler(likeService)
 
 	commentMQ, err := rabbitmq.NewCommentMQ(rmq)
 	if err != nil {
 		log.Printf("CommentMQ init failed (mq disabled): %v", err)
 		commentMQ = nil
 	}
-	commentRepository := video.NewCommentRepository(sqlDB)
-	commentService := video.NewCommentService(commentRepository, videoRepository, cache, commentMQ, popularityMQ)
-	commentHandler := video.NewCommentHandler(commentService)
+	commentRepository := videomysql.NewCommentRepository(sqlDB)
+	var commentPublisher appvideo.CommentEventPublisher
+	if commentMQ != nil {
+		commentPublisher = commentMQ
+	}
+	commentService := appvideo.NewCommentService(commentRepository, videoRepository, commentPublisher, popularityPublisher, popularityCache)
+	commentHandler := httpvideo.NewCommentHandler(commentService)
 
 	// ============================================================
 	// 组合根：社交
@@ -176,7 +192,7 @@ func main() {
 		feedRepository,
 		likeRepository,
 		cache,
-		timelineredis.NewTimelineRepository(cache),
+		rediscache.NewTimelineRepository(cache),
 		accountmysql.NewCreatorStatsRepository(sqlDB),
 	)
 	feedHandler := feed.NewFeedHandler(feedService)
@@ -190,7 +206,7 @@ func main() {
 		timelineMQ = nil
 	}
 	if timelineMQ != nil {
-		worker.StartOutboxPoller(sqlDB, timelineMQ)
+		worker.StartOutboxPoller(videomysql.NewOutboxRepository(sqlDB), timelineMQ)
 		worker.StartConsumer(timelineMQ, rabbitmq.TimelineQueueName, cache)
 	}
 

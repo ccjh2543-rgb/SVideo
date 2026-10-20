@@ -3,8 +3,8 @@ package db
 import (
 	"feedsystem_video_go/internal/config"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
 	"fmt"
 
 	"gorm.io/driver/mysql"
@@ -29,11 +29,11 @@ func AutoMigrate(db *gorm.DB) error {
 		&accountmysql.RefreshTokenModel{},
 		&accountmysql.CreatorStatsModel{},
 		&accountmysql.ProcessedEventModel{},
-		&video.Video{},
-		&video.Like{},
-		&video.Comment{},
+		&videomysql.VideoModel{},
+		&videomysql.LikeModel{},
+		&videomysql.CommentModel{},
 		&social.Social{},
-		&video.OutboxMsg{},
+		&videomysql.OutboxModel{},
 	)
 }
 

@@ -5,22 +5,29 @@ import (
 	"encoding/json"
 	"errors"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	videocache "feedsystem_video_go/internal/infrastructure/cache/redis/video"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
-	"feedsystem_video_go/internal/video"
 	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type PopularityWorker struct {
-	ch     *amqp.Channel
-	cache  *rediscache.Client
-	events EventIdempotency
-	queue  string
+	ch      *amqp.Channel
+	cache   *rediscache.Client
+	updater *videocache.PopularityCache
+	events  EventIdempotency
+	queue   string
 }
 
 func NewPopularityWorker(ch *amqp.Channel, cache *rediscache.Client, events EventIdempotency, queue string) *PopularityWorker {
-	return &PopularityWorker{ch: ch, cache: cache, events: events, queue: queue}
+	return &PopularityWorker{
+		ch:      ch,
+		cache:   cache,
+		updater: videocache.NewPopularityCache(cache),
+		events:  events,
+		queue:   queue,
+	}
 }
 
 func (w *PopularityWorker) Run(ctx context.Context) error {
@@ -83,6 +90,6 @@ func (w *PopularityWorker) process(ctx context.Context, body []byte) error {
 			return nil
 		}
 	}
-	video.UpdatePopularityCache(ctx, w.cache, evt.VideoID, evt.Change)
+	_ = w.updater.Update(ctx, evt.VideoID, evt.Change)
 	return nil
 }

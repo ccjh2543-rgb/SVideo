@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	domainnotification "feedsystem_video_go/internal/domain/notification"
+	domainvideo "feedsystem_video_go/internal/domain/video"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
-	"feedsystem_video_go/internal/video"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
 	"time"
@@ -14,8 +14,8 @@ import (
 
 type LikeWorker struct {
 	ch       *amqp.Channel
-	likes    *video.LikeRepository
-	videos   *video.VideoRepository
+	likes    domainvideo.LikeRepository
+	videos   domainvideo.VideoRepository
 	events   EventIdempotency
 	notifier domainnotification.Notifier
 	queue    string
@@ -23,8 +23,8 @@ type LikeWorker struct {
 
 func NewLikeWorker(
 	ch *amqp.Channel,
-	likes *video.LikeRepository,
-	videos *video.VideoRepository,
+	likes domainvideo.LikeRepository,
+	videos domainvideo.VideoRepository,
 	events EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
@@ -114,7 +114,7 @@ func (w *LikeWorker) applyLike(ctx context.Context, userID, videoID uint, eventI
 		return nil
 	}
 
-	created, err := w.likes.LikeIgnoreDuplicate(ctx, &video.Like{
+	created, err := w.likes.LikeIgnoreDuplicate(ctx, &domainvideo.Like{
 		VideoID:   videoID,
 		AccountID: userID,
 		CreatedAt: time.Now(),

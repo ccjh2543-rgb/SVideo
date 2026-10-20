@@ -6,13 +6,12 @@ import (
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
-	timelineredis "feedsystem_video_go/internal/infrastructure/cache/redis"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
 	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
 	"feedsystem_video_go/internal/worker"
 	"log"
 	"os"
@@ -161,9 +160,9 @@ func main() {
 	// ============================================================
 	// 这些 Repository 封装了与数据库的交互逻辑，供 Worker 在处理消息时使用
 	repo := social.NewSocialRepository(sqlDB)
-	videoRepo := video.NewVideoRepository(sqlDB)
-	likeRepo := video.NewLikeRepository(sqlDB)
-	commentRepo := video.NewCommentRepository(sqlDB)
+	videoRepo := videomysql.NewVideoRepository(sqlDB)
+	likeRepo := videomysql.NewLikeRepository(sqlDB)
+	commentRepo := videomysql.NewCommentRepository(sqlDB)
 	creatorRepo := accountmysql.NewCreatorStatsRepository(sqlDB)
 	processedEvents := accountmysql.NewProcessedEventRepository(sqlDB)
 	notifier := ws.NewRedisNotifier(cache, nil)
@@ -173,7 +172,7 @@ func main() {
 		fanoutService = feedapp.NewFanoutService(
 			creatorRepo,
 			repo,
-			timelineredis.NewTimelineRepository(cache),
+			rediscache.NewTimelineRepository(cache),
 			0,
 			500,
 		)
