@@ -3,7 +3,7 @@ package social
 import (
 	"context"
 	"errors"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 )
 
 // AccountExister 账号存在性接口，由账号上下文实现。

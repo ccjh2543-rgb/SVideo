@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	domainnotification "feedsystem_video_go/internal/domain/notification"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	"feedsystem_video_go/internal/video"
 	"log"
 	"strings"

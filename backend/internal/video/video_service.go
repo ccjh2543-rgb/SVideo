@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	cachelib "feedsystem_video_go/internal/middleware/cache"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	cachelib "feedsystem_video_go/internal/infrastructure/cache"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 
 	"gorm.io/gorm"
 )

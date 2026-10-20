@@ -3,8 +3,8 @@ package video
 import (
 	"context"
 	"errors"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	"strings"
 
 	"gorm.io/gorm"

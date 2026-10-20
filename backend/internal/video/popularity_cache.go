@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 )
 
 // UpdatePopularityCache 更新视频的流行度缓存

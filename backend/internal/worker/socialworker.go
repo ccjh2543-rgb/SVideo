@@ -6,7 +6,7 @@ import (
 	"errors"
 	"feedsystem_video_go/internal/domain/creator"
 	domainnotification "feedsystem_video_go/internal/domain/notification"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/util"
 	"log"

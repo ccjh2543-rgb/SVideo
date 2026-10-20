@@ -3,9 +3,9 @@ package http
 import (
 	domainaccount "feedsystem_video_go/internal/domain/account"
 	"feedsystem_video_go/internal/feed"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
 	"feedsystem_video_go/internal/interfaces/ws"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
 	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/video"
 )

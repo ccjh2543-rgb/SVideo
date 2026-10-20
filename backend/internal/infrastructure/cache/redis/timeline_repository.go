@@ -8,7 +8,6 @@ import (
 	"time"
 
 	domainfeed "feedsystem_video_go/internal/domain/feed"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
 
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -21,11 +20,11 @@ const (
 
 // TimelineRepository 推拉结合时间线的 Redis 实现。
 type TimelineRepository struct {
-	cache *rediscache.Client
+	cache *Client
 }
 
 // NewTimelineRepository 创建时间线仓储。
-func NewTimelineRepository(cache *rediscache.Client) *TimelineRepository {
+func NewTimelineRepository(cache *Client) *TimelineRepository {
 	return &TimelineRepository{cache: cache}
 }
 

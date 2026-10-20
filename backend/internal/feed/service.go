@@ -20,8 +20,8 @@ import (
 
 	domaincreator "feedsystem_video_go/internal/domain/creator"
 	domainfeed "feedsystem_video_go/internal/domain/feed"
-	cachelib "feedsystem_video_go/internal/middleware/cache"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	cachelib "feedsystem_video_go/internal/infrastructure/cache"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	"feedsystem_video_go/internal/video"
 	"fmt"
 	"log"

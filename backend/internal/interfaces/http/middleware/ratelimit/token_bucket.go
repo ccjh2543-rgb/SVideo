@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	jwt "feedsystem_video_go/internal/middleware/jwt"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	jwt "feedsystem_video_go/internal/interfaces/http/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
 )

@@ -11,7 +11,7 @@
 package feed
 
 import (
-	"feedsystem_video_go/internal/middleware/jwt"
+	"feedsystem_video_go/internal/interfaces/http/middleware/jwt"
 	"time"
 
 	"github.com/gin-gonic/gin"

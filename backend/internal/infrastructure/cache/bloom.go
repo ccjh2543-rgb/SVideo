@@ -6,7 +6,7 @@ import (
 	"hash/fnv"
 	"sync/atomic"
 
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 )
 
 const (

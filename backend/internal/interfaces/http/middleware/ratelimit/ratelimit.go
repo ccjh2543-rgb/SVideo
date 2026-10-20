@@ -1,7 +1,7 @@
 package ratelimit
 
 import (
-	jwt "feedsystem_video_go/internal/middleware/jwt"
+	jwt "feedsystem_video_go/internal/interfaces/http/middleware/jwt"
 	"fmt"
 	"strconv"
 	"strings"

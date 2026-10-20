@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 )
 
 // LogicalEntry 逻辑过期缓存包装。

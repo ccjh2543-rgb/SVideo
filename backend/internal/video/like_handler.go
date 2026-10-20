@@ -1,7 +1,7 @@
 package video
 
 import (
-	"feedsystem_video_go/internal/middleware/jwt"
+	"feedsystem_video_go/internal/interfaces/http/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
 )

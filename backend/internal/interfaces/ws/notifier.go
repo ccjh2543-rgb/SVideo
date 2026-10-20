@@ -6,7 +6,7 @@ import (
 	"log"
 
 	domainnotification "feedsystem_video_go/internal/domain/notification"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
+	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 )
 
 // NotificationChannel 所有 API 实例共享的 Redis Pub/Sub 频道。

@@ -4,9 +4,9 @@ import (
 	"log"
 	"time"
 
-	"feedsystem_video_go/internal/middleware/idempotency"
-	"feedsystem_video_go/internal/middleware/jwt"
-	"feedsystem_video_go/internal/middleware/ratelimit"
+	"feedsystem_video_go/internal/interfaces/http/middleware/idempotency"
+	"feedsystem_video_go/internal/interfaces/http/middleware/jwt"
+	"feedsystem_video_go/internal/interfaces/http/middleware/ratelimit"
 
 	"github.com/gin-gonic/gin"
 )

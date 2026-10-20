@@ -8,7 +8,7 @@ import (
 
 	appaccount "feedsystem_video_go/internal/application/account"
 	domainaccount "feedsystem_video_go/internal/domain/account"
-	"feedsystem_video_go/internal/middleware/jwt"
+	"feedsystem_video_go/internal/interfaces/http/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
 )

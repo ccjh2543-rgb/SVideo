@@ -8,7 +8,7 @@ import (
 	"time"
 
 	feedapp "feedsystem_video_go/internal/application/feed"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )

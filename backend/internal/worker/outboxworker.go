@@ -3,8 +3,8 @@ package worker
 import (
 	"context"
 	"encoding/json"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
-	"feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/infrastructure/cache/redis"
+	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	"feedsystem_video_go/internal/video"
 	"fmt"
 	"log"
