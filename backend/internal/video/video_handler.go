@@ -1,7 +1,6 @@
 package video
 
 import (
-	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/middleware/jwt"
 	"feedsystem_video_go/internal/util"
 	"fmt"
@@ -16,12 +15,11 @@ import (
 )
 
 type VideoHandler struct {
-	service        *VideoService
-	accountService *account.AccountService
+	service *VideoService
 }
 
-func NewVideoHandler(service *VideoService, accountService *account.AccountService) *VideoHandler {
-	return &VideoHandler{service: service, accountService: accountService}
+func NewVideoHandler(service *VideoService) *VideoHandler {
+	return &VideoHandler{service: service}
 }
 
 func (vh *VideoHandler) PublishVideo(c *gin.Context) {

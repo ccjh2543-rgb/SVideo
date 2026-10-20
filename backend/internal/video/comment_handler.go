@@ -1,19 +1,17 @@
 package video
 
 import (
-	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/middleware/jwt"
 
 	"github.com/gin-gonic/gin"
 )
 
 type CommentHandler struct {
-	service        *CommentService
-	accountService *account.AccountService
+	service *CommentService
 }
 
-func NewCommentHandler(service *CommentService, accountService *account.AccountService) *CommentHandler {
-	return &CommentHandler{service: service, accountService: accountService}
+func NewCommentHandler(service *CommentService) *CommentHandler {
+	return &CommentHandler{service: service}
 }
 func (h *CommentHandler) PublishComment(c *gin.Context) {
 	var req PublishCommentRequest
@@ -34,13 +32,13 @@ func (h *CommentHandler) PublishComment(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	user, err := h.accountService.FindByID(c.Request.Context(), authorId)
+	username, err := jwt.GetUsername(c)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 	comment := &Comment{
-		Username: user.Username,
+		Username: username,
 		VideoID:  req.VideoID,
 		AuthorID: authorId,
 		Content:  req.Content,

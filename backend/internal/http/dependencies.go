@@ -1,0 +1,27 @@
+package http
+
+import (
+	domainaccount "feedsystem_video_go/internal/domain/account"
+	"feedsystem_video_go/internal/feed"
+	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	"feedsystem_video_go/internal/interfaces/ws"
+	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/social"
+	"feedsystem_video_go/internal/video"
+)
+
+// Dependencies HTTP 层依赖集合。
+// 所有 Repository、Service、Handler 的创建都在 cmd/api 组合根完成，
+// Router 只负责注册路由，不再承担对象构造职责。
+type Dependencies struct {
+	AccountHandler *httpaccount.Handler
+	VideoHandler   *video.VideoHandler
+	LikeHandler    *video.LikeHandler
+	CommentHandler *video.CommentHandler
+	SocialHandler  *social.SocialHandler
+	FeedHandler    *feed.FeedHandler
+	WSHandler      *ws.Handler
+
+	Tokens domainaccount.TokenService
+	Cache  *rediscache.Client
+}

@@ -2,7 +2,6 @@ package social
 
 import (
 	"context"
-	"feedsystem_video_go/internal/account"
 
 	"gorm.io/gorm"
 )
@@ -25,7 +24,7 @@ func (r *SocialRepository) Unfollow(ctx context.Context, social *Social) error {
 		Delete(&Social{}).Error
 }
 
-func (r *SocialRepository) GetAllFollowers(ctx context.Context, VloggerID uint) ([]*account.Account, error) {
+func (r *SocialRepository) GetAllFollowers(ctx context.Context, VloggerID uint) ([]*AccountInfo, error) {
 	var relations []Social
 	if err := r.db.WithContext(ctx).
 		Model(&Social{}).
@@ -39,12 +38,13 @@ func (r *SocialRepository) GetAllFollowers(ctx context.Context, VloggerID uint) 
 		followerIDs = append(followerIDs, rel.FollowerID)
 	}
 	if len(followerIDs) == 0 {
-		return []*account.Account{}, nil
+		return []*AccountInfo{}, nil
 	}
 
-	var followers []*account.Account
+	var followers []*AccountInfo
 	if err := r.db.WithContext(ctx).
-		Model(&account.Account{}).
+		Table("accounts").
+		Select("id, username").
 		Where("id IN ?", followerIDs).
 		Find(&followers).Error; err != nil {
 		return nil, err
@@ -73,7 +73,7 @@ func (r *SocialRepository) ListFollowerIDsAfter(ctx context.Context, vloggerID u
 	return followerIDs, nil
 }
 
-func (r *SocialRepository) GetAllVloggers(ctx context.Context, FollowerID uint) ([]*account.Account, error) {
+func (r *SocialRepository) GetAllVloggers(ctx context.Context, FollowerID uint) ([]*AccountInfo, error) {
 	var relations []Social
 	if err := r.db.WithContext(ctx).
 		Model(&Social{}).
@@ -87,12 +87,13 @@ func (r *SocialRepository) GetAllVloggers(ctx context.Context, FollowerID uint) 
 		vloggerIDs = append(vloggerIDs, rel.VloggerID)
 	}
 	if len(vloggerIDs) == 0 {
-		return []*account.Account{}, nil
+		return []*AccountInfo{}, nil
 	}
 
-	var vloggers []*account.Account
+	var vloggers []*AccountInfo
 	if err := r.db.WithContext(ctx).
-		Model(&account.Account{}).
+		Table("accounts").
+		Select("id, username").
 		Where("id IN ?", vloggerIDs).
 		Find(&vloggers).Error; err != nil {
 		return nil, err

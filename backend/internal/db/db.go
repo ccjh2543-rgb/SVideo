@@ -1,7 +1,6 @@
 package db
 
 import (
-	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/config"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
 	"feedsystem_video_go/internal/social"
@@ -26,7 +25,7 @@ func NewDB(dbcfg config.DatabaseConfig) (*gorm.DB, error) {
 
 func AutoMigrate(db *gorm.DB) error {
 	return db.AutoMigrate(
-		&account.Account{},
+		&accountmysql.AccountModel{},
 		&accountmysql.RefreshTokenModel{},
 		&accountmysql.CreatorStatsModel{},
 		&accountmysql.ProcessedEventModel{},

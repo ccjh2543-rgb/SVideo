@@ -3,33 +3,46 @@ package social
 import (
 	"context"
 	"errors"
-	"feedsystem_video_go/internal/account"
 	"feedsystem_video_go/internal/middleware/rabbitmq"
 )
 
-// AccountFinder 定义查找用户账号的接口，由 account 包实现。
-// 在 social 包中定义接口而非直接依赖具体类型，遵循 Go 依赖反转原则。
-type AccountFinder interface {
-	FindByID(ctx context.Context, id uint) (*account.Account, error)
+// AccountExister 账号存在性接口，由账号上下文实现。
+// social 只关心账号是否存在，不依赖账号实体和密码等细节。
+type AccountExister interface {
+	Exists(ctx context.Context, id uint) (bool, error)
 }
 
 type SocialService struct {
 	repo        *SocialRepository
-	accountRepo AccountFinder
+	accountRepo AccountExister
 	socialMQ    *rabbitmq.SocialMQ
 }
 
-func NewSocialService(repo *SocialRepository, accountRepo *account.AccountRepository, socialMQ *rabbitmq.SocialMQ) *SocialService {
+func NewSocialService(repo *SocialRepository, accountRepo AccountExister, socialMQ *rabbitmq.SocialMQ) *SocialService {
 	return &SocialService{repo: repo, accountRepo: accountRepo, socialMQ: socialMQ}
 }
 
-func (s *SocialService) Follow(ctx context.Context, social *Social) error {
-	_, err := s.accountRepo.FindByID(ctx, social.FollowerID)
+// ensureAccountsExist 校验关注双方账号都存在。
+func (s *SocialService) ensureAccountsExist(ctx context.Context, followerID, vloggerID uint) error {
+	ok, err := s.accountRepo.Exists(ctx, followerID)
 	if err != nil {
 		return err
 	}
-	_, err = s.accountRepo.FindByID(ctx, social.VloggerID)
+	if !ok {
+		return errors.New("follower account not found")
+	}
+	ok, err = s.accountRepo.Exists(ctx, vloggerID)
 	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("vlogger account not found")
+	}
+	return nil
+}
+
+func (s *SocialService) Follow(ctx context.Context, social *Social) error {
+	if err := s.ensureAccountsExist(ctx, social.FollowerID, social.VloggerID); err != nil {
 		return err
 	}
 	if social.FollowerID == social.VloggerID {
@@ -51,12 +64,7 @@ func (s *SocialService) Follow(ctx context.Context, social *Social) error {
 }
 
 func (s *SocialService) Unfollow(ctx context.Context, social *Social) error {
-	_, err := s.accountRepo.FindByID(ctx, social.FollowerID)
-	if err != nil {
-		return err
-	}
-	_, err = s.accountRepo.FindByID(ctx, social.VloggerID)
-	if err != nil {
+	if err := s.ensureAccountsExist(ctx, social.FollowerID, social.VloggerID); err != nil {
 		return err
 	}
 	isFollowed, err := s.repo.IsFollowed(ctx, social)
@@ -74,29 +82,30 @@ func (s *SocialService) Unfollow(ctx context.Context, social *Social) error {
 	return s.repo.Unfollow(ctx, social)
 }
 
-func (s *SocialService) GetAllFollowers(ctx context.Context, VloggerID uint) ([]*account.Account, error) {
-	_, err := s.accountRepo.FindByID(ctx, VloggerID)
+func (s *SocialService) GetAllFollowers(ctx context.Context, VloggerID uint) ([]*AccountInfo, error) {
+	ok, err := s.accountRepo.Exists(ctx, VloggerID)
 	if err != nil {
 		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("vlogger account not found")
 	}
 	return s.repo.GetAllFollowers(ctx, VloggerID)
 }
 
-func (s *SocialService) GetAllVloggers(ctx context.Context, FollowerID uint) ([]*account.Account, error) {
-	_, err := s.accountRepo.FindByID(ctx, FollowerID)
+func (s *SocialService) GetAllVloggers(ctx context.Context, FollowerID uint) ([]*AccountInfo, error) {
+	ok, err := s.accountRepo.Exists(ctx, FollowerID)
 	if err != nil {
 		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("follower account not found")
 	}
 	return s.repo.GetAllVloggers(ctx, FollowerID)
 }
 
 func (s *SocialService) IsFollowed(ctx context.Context, social *Social) (bool, error) {
-	_, err := s.accountRepo.FindByID(ctx, social.FollowerID)
-	if err != nil {
-		return false, err
-	}
-	_, err = s.accountRepo.FindByID(ctx, social.VloggerID)
-	if err != nil {
+	if err := s.ensureAccountsExist(ctx, social.FollowerID, social.VloggerID); err != nil {
 		return false, err
 	}
 	return s.repo.IsFollowed(ctx, social)

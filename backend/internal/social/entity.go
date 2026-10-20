@@ -1,6 +1,10 @@
 package social
 
-import "feedsystem_video_go/internal/account"
+// AccountInfo 社交列表返回的账号信息，避免暴露密码等账号内部字段。
+type AccountInfo struct {
+	ID       uint   `json:"id"`
+	Username string `json:"username"`
+}
 
 // Social 博主-粉丝关注关系表（数据库实体）
 // 设计说明：这是一个典型的"多对多关系"中间表，实现类似抖音的"关注-粉丝"功能
@@ -38,7 +42,7 @@ type GetAllFollowersRequest struct {
 
 // 查询博主所有粉丝时的响应参数
 type GetAllFollowersResponse struct {
-	Followers []*account.Account `json:"followers"`
+	Followers []*AccountInfo `json:"followers"`
 }
 
 // 查询关注列表时的请求参数
@@ -48,5 +52,5 @@ type GetAllVloggersRequest struct {
 
 // 查询关注列表时的响应参数
 type GetAllVloggersResponse struct {
-	Vloggers []*account.Account `json:"vloggers"`
+	Vloggers []*AccountInfo `json:"vloggers"`
 }

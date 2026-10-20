@@ -2,20 +2,28 @@ package main
 
 import (
 	"context"
-	appaccount "feedsystem_video_go/internal/application/account"
-	"feedsystem_video_go/internal/config"
-	"feedsystem_video_go/internal/db"
-	apphttp "feedsystem_video_go/internal/http"
-	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
-	"feedsystem_video_go/internal/infrastructure/security"
-	"feedsystem_video_go/internal/interfaces/ws"
-	rabbitmq "feedsystem_video_go/internal/middleware/rabbitmq"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
-	"feedsystem_video_go/internal/observability"
 	"log"
 	"os"
 	"strconv"
 	"time"
+
+	appaccount "feedsystem_video_go/internal/application/account"
+	"feedsystem_video_go/internal/config"
+	"feedsystem_video_go/internal/db"
+	"feedsystem_video_go/internal/feed"
+	apphttp "feedsystem_video_go/internal/http"
+	timelineredis "feedsystem_video_go/internal/infrastructure/cache/redis"
+	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	"feedsystem_video_go/internal/infrastructure/security"
+	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	"feedsystem_video_go/internal/interfaces/ws"
+	cachelib "feedsystem_video_go/internal/middleware/cache"
+	rabbitmq "feedsystem_video_go/internal/middleware/rabbitmq"
+	rediscache "feedsystem_video_go/internal/middleware/redis"
+	"feedsystem_video_go/internal/observability"
+	"feedsystem_video_go/internal/social"
+	"feedsystem_video_go/internal/video"
+	"feedsystem_video_go/internal/worker"
 )
 
 // 加载配置
@@ -31,7 +39,6 @@ func main() {
 		// 统一相对于 backend 工作目录解析，兼容本地 go run 与容器内 /app。
 		configPath = "configs/config.yaml"
 	}
-	//log.Printf("Loading config from %s", configPath)
 	cfg, usedDefault, err := config.LoadLocalDev(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -43,7 +50,6 @@ func main() {
 	}
 
 	// 连接数据库
-	//log.Printf("Database config: %v", cfg.Database)
 	sqlDB, err := db.NewDB(cfg.Database)
 	if err != nil {
 		log.Fatalf("Failed to connect database: %v", err)
@@ -80,6 +86,7 @@ func main() {
 		defer rmq.Close()
 		log.Printf("RabbitMQ connected")
 	}
+
 	// Pprof
 	pprofServer, err := observability.NewPprofServer(
 		"API",
@@ -91,7 +98,9 @@ func main() {
 	}
 	defer pprofServer.Close()
 
-	// 组合根：构造账号领域依赖
+	// ============================================================
+	// 组合根：账号
+	// ============================================================
 	tokens, err := security.NewJWTServiceFromEnv()
 	if err != nil {
 		log.Fatalf("Failed to initialize JWT service: %v", err)
@@ -104,8 +113,90 @@ func main() {
 		tokens,
 		security.NewBcryptHasher(),
 	)
+	accountHandler := httpaccount.NewHandler(accountApp)
 
-	// WebSocket 通知：Hub 管理本机连接，Redis Pub/Sub 负责多实例广播。
+	// ============================================================
+	// 组合根：视频、点赞、评论
+	// ============================================================
+	videoRepository := video.NewVideoRepository(sqlDB)
+	popularityMQ, err := rabbitmq.NewPopularityMQ(rmq)
+	if err != nil {
+		log.Printf("PopularityMQ init failed (mq disabled): %v", err)
+		popularityMQ = nil
+	}
+
+	bloom := cachelib.NewBloomFilter(cache, "bloom:video_ids", 0, 0)
+	videoService := video.NewVideoService(videoRepository, cache, popularityMQ, bloom)
+	if cache != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := videoService.RebuildBloom(ctx); err != nil {
+				log.Printf("Rebuild video bloom filter failed: %v", err)
+			}
+		}()
+	}
+	videoHandler := video.NewVideoHandler(videoService)
+
+	likeMQ, err := rabbitmq.NewLikeMQ(rmq)
+	if err != nil {
+		log.Printf("LikeMQ init failed (mq disabled): %v", err)
+		likeMQ = nil
+	}
+	likeRepository := video.NewLikeRepository(sqlDB)
+	likeService := video.NewLikeService(likeRepository, videoRepository, cache, likeMQ, popularityMQ)
+	likeHandler := video.NewLikeHandler(likeService)
+
+	commentMQ, err := rabbitmq.NewCommentMQ(rmq)
+	if err != nil {
+		log.Printf("CommentMQ init failed (mq disabled): %v", err)
+		commentMQ = nil
+	}
+	commentRepository := video.NewCommentRepository(sqlDB)
+	commentService := video.NewCommentService(commentRepository, videoRepository, cache, commentMQ, popularityMQ)
+	commentHandler := video.NewCommentHandler(commentService)
+
+	// ============================================================
+	// 组合根：社交
+	// ============================================================
+	socialMQ, err := rabbitmq.NewSocialMQ(rmq)
+	if err != nil {
+		log.Printf("SocialMQ init failed (mq disabled): %v", err)
+		socialMQ = nil
+	}
+	socialRepository := social.NewSocialRepository(sqlDB)
+	socialService := social.NewSocialService(socialRepository, accountRepository, socialMQ)
+	socialHandler := social.NewSocialHandler(socialService)
+
+	// ============================================================
+	// 组合根：Feed
+	// ============================================================
+	feedRepository := feed.NewFeedRepository(sqlDB)
+	feedService := feed.NewFeedService(
+		feedRepository,
+		likeRepository,
+		cache,
+		timelineredis.NewTimelineRepository(cache),
+		accountmysql.NewCreatorStatsRepository(sqlDB),
+	)
+	feedHandler := feed.NewFeedHandler(feedService)
+
+	// ============================================================
+	// 组合根：时间线消费者
+	// ============================================================
+	timelineMQ, err := rabbitmq.NewTimelineMQ(rmq)
+	if err != nil {
+		log.Printf("timelineMQ init failed (mq disabled): %v", err)
+		timelineMQ = nil
+	}
+	if timelineMQ != nil {
+		worker.StartOutboxPoller(sqlDB, timelineMQ)
+		worker.StartConsumer(timelineMQ, rabbitmq.TimelineQueueName, cache)
+	}
+
+	// ============================================================
+	// 组合根：WebSocket 通知
+	// ============================================================
 	wsHub := ws.NewHub()
 	wsNotifier := ws.NewRedisNotifier(cache, wsHub)
 	wsCtx, wsCancel := context.WithCancel(context.Background())
@@ -117,8 +208,20 @@ func main() {
 	}()
 	wsHandler := ws.NewHandler(tokens, wsHub)
 
-	// 设置路由
-	r := apphttp.SetRouter(sqlDB, cache, rmq, accountApp, tokens, wsHandler)
+	// ============================================================
+	// 路由装配
+	// ============================================================
+	r := apphttp.SetRouter(apphttp.Dependencies{
+		AccountHandler: accountHandler,
+		VideoHandler:   videoHandler,
+		LikeHandler:    likeHandler,
+		CommentHandler: commentHandler,
+		SocialHandler:  socialHandler,
+		FeedHandler:    feedHandler,
+		WSHandler:      wsHandler,
+		Tokens:         tokens,
+		Cache:          cache,
+	})
 	log.Printf("Server is running on port %d", cfg.Server.Port)
 	if err := r.Run(":" + strconv.Itoa(cfg.Server.Port)); err != nil {
 		log.Fatalf("Failed to run server: %v", err)

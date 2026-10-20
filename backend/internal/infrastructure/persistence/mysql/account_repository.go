@@ -52,6 +52,21 @@ func (r *AccountRepository) FindByID(ctx context.Context, id uint) (*domainaccou
 	return model.toDomain(), nil
 }
 
+// Exists 判断账号是否存在，供社交等上下文做轻量校验。
+func (r *AccountRepository) Exists(ctx context.Context, id uint) (bool, error) {
+	if id == 0 {
+		return false, nil
+	}
+	var count int64
+	if err := r.db.WithContext(ctx).
+		Model(&AccountModel{}).
+		Where("id = ?", id).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // FindByUsername 按用户名查询账号。
 func (r *AccountRepository) FindByUsername(ctx context.Context, username string) (*domainaccount.Account, error) {
 	var model AccountModel

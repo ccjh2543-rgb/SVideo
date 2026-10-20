@@ -1,51 +1,31 @@
 package http
 
 import (
-	"context"
 	"log"
 	"time"
 
-	"feedsystem_video_go/internal/account"
-	appaccount "feedsystem_video_go/internal/application/account"
-	domainaccount "feedsystem_video_go/internal/domain/account"
-	"feedsystem_video_go/internal/feed"
-	timelineredis "feedsystem_video_go/internal/infrastructure/cache/redis"
-	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
-	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
-	"feedsystem_video_go/internal/interfaces/ws"
-	cachelib "feedsystem_video_go/internal/middleware/cache"
 	"feedsystem_video_go/internal/middleware/idempotency"
 	"feedsystem_video_go/internal/middleware/jwt"
-	"feedsystem_video_go/internal/middleware/rabbitmq"
 	"feedsystem_video_go/internal/middleware/ratelimit"
-	rediscache "feedsystem_video_go/internal/middleware/redis"
-	"feedsystem_video_go/internal/social"
-	"feedsystem_video_go/internal/video"
-	"feedsystem_video_go/internal/worker"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
-// SetRouter 组装 HTTP 路由。
-// accountApp 与 tokens 由 main 作为组合根注入，路由层不负责创建基础设施。
-func SetRouter(
-	db *gorm.DB,
-	cache *rediscache.Client,
-	rmq *rabbitmq.RabbitMQ,
-	accountApp *appaccount.Service,
-	tokens domainaccount.TokenService,
-	wsHandler *ws.Handler,
-) *gin.Engine {
+// SetRouter 只负责注册路由和接口层中间件。
+// Repository、Service、Handler、MQ 的统一装配在 cmd/api/main.go 完成。
+func SetRouter(deps Dependencies) *gin.Engine {
 	r := gin.Default()
 	if err := r.SetTrustedProxies(nil); err != nil {
 		log.Printf("SetTrustedProxies failed: %v", err)
 	}
 	r.MaxMultipartMemory = 256 << 20      // 256MB
 	r.Static("/static", "./.run/uploads") // 静态文件映射
-	if wsHandler != nil {
-		r.GET("/ws", wsHandler.Handle)
+	if deps.WSHandler != nil {
+		r.GET("/ws", deps.WSHandler.Handle)
 	}
+
+	cache := deps.Cache
+	tokens := deps.Tokens
 
 	// 通用限流器：登录/注册按 IP，业务写操作按账号，Feed 按账号或 IP。
 	registerLimit := ratelimit.TokenBucket(cache, "account:register", ratelimit.TokenBucketConfig{
@@ -85,126 +65,62 @@ func SetRouter(
 	commentIdempotency := idempotency.Require(cache, "video:comment", 24*time.Hour)
 
 	// account
-	accountRepository := account.NewAccountRepository(db)
-	accountService := account.NewAccountService(accountRepository, cache)
-	accountHandler := httpaccount.NewHandler(accountApp)
 	accountGroup := r.Group("/account")
 	{
-		accountGroup.POST("/register", registerLimit, accountHandler.Register)
-		accountGroup.POST("/login", loginLimit, accountHandler.Login)
-		accountGroup.POST("/refresh", refreshLimit, accountHandler.Refresh)
-		accountGroup.POST("/logout", jwt.JWTAuth(tokens), accountHandler.Logout)
-		accountGroup.POST("/changePassword", jwt.JWTAuth(tokens), accountHandler.ChangePassword)
-		accountGroup.POST("/rename", jwt.JWTAuth(tokens), accountHandler.Rename)
-		accountGroup.POST("/findByID", readLimit, accountHandler.FindByID)
-		accountGroup.POST("/findByUsername", readLimit, accountHandler.FindByUsername)
+		accountGroup.POST("/register", registerLimit, deps.AccountHandler.Register)
+		accountGroup.POST("/login", loginLimit, deps.AccountHandler.Login)
+		accountGroup.POST("/refresh", refreshLimit, deps.AccountHandler.Refresh)
+		accountGroup.POST("/logout", jwt.JWTAuth(tokens), deps.AccountHandler.Logout)
+		accountGroup.POST("/changePassword", jwt.JWTAuth(tokens), deps.AccountHandler.ChangePassword)
+		accountGroup.POST("/rename", jwt.JWTAuth(tokens), deps.AccountHandler.Rename)
+		accountGroup.POST("/findByID", readLimit, deps.AccountHandler.FindByID)
+		accountGroup.POST("/findByUsername", readLimit, deps.AccountHandler.FindByUsername)
 	}
 
 	// video
-	videoRepository := video.NewVideoRepository(db)
-	popularityMQ, err := rabbitmq.NewPopularityMQ(rmq)
-	if err != nil {
-		log.Printf("PopularityMQ init failed (mq disabled): %v", err)
-		popularityMQ = nil
-	}
-	bloom := cachelib.NewBloomFilter(cache, "bloom:video_ids", 0, 0)
-	videoService := video.NewVideoService(videoRepository, cache, popularityMQ, bloom)
-	if cache != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := videoService.RebuildBloom(ctx); err != nil {
-				log.Printf("Rebuild video bloom filter failed: %v", err)
-			}
-		}()
-	}
-	videoHandler := video.NewVideoHandler(videoService, accountService)
 	videoGroup := r.Group("/video")
 	{
-		videoGroup.POST("/listByAuthorID", videoHandler.ListByAuthorID)
-		videoGroup.POST("/getDetail", videoHandler.GetDetail)
-		videoGroup.POST("/uploadVideo", jwt.JWTAuth(tokens), uploadLimit, videoHandler.UploadVideo)
-		videoGroup.POST("/uploadCover", jwt.JWTAuth(tokens), uploadLimit, videoHandler.UploadCover)
-		videoGroup.POST("/publish", jwt.JWTAuth(tokens), publishLimit, publishIdempotency, videoHandler.PublishVideo)
+		videoGroup.POST("/listByAuthorID", deps.VideoHandler.ListByAuthorID)
+		videoGroup.POST("/getDetail", deps.VideoHandler.GetDetail)
+		videoGroup.POST("/uploadVideo", jwt.JWTAuth(tokens), uploadLimit, deps.VideoHandler.UploadVideo)
+		videoGroup.POST("/uploadCover", jwt.JWTAuth(tokens), uploadLimit, deps.VideoHandler.UploadCover)
+		videoGroup.POST("/publish", jwt.JWTAuth(tokens), publishLimit, publishIdempotency, deps.VideoHandler.PublishVideo)
 	}
 
 	// like
-	likeMQ, err := rabbitmq.NewLikeMQ(rmq)
-	if err != nil {
-		log.Printf("LikeMQ init failed (mq disabled): %v", err)
-		likeMQ = nil
-	}
-	likeRepository := video.NewLikeRepository(db)
-	likeService := video.NewLikeService(likeRepository, videoRepository, cache, likeMQ, popularityMQ)
-	likeHandler := video.NewLikeHandler(likeService)
 	likeGroup := r.Group("/like")
 	{
-		likeGroup.POST("/like", jwt.JWTAuth(tokens), likeLimit, likeIdempotency, likeHandler.Like)
-		likeGroup.POST("/unlike", jwt.JWTAuth(tokens), likeLimit, unlikeIdempotency, likeHandler.Unlike)
-		likeGroup.POST("/isLiked", jwt.JWTAuth(tokens), likeHandler.IsLiked)
-		likeGroup.POST("/listMyLikedVideos", jwt.JWTAuth(tokens), likeHandler.ListMyLikedVideos)
+		likeGroup.POST("/like", jwt.JWTAuth(tokens), likeLimit, likeIdempotency, deps.LikeHandler.Like)
+		likeGroup.POST("/unlike", jwt.JWTAuth(tokens), likeLimit, unlikeIdempotency, deps.LikeHandler.Unlike)
+		likeGroup.POST("/isLiked", jwt.JWTAuth(tokens), deps.LikeHandler.IsLiked)
+		likeGroup.POST("/listMyLikedVideos", jwt.JWTAuth(tokens), deps.LikeHandler.ListMyLikedVideos)
 	}
 
 	// comment
-	commentRepository := video.NewCommentRepository(db)
-	commentMQ, err := rabbitmq.NewCommentMQ(rmq)
-	if err != nil {
-		log.Printf("CommentMQ init failed (mq disabled): %v", err)
-		commentMQ = nil
-	}
-	commentService := video.NewCommentService(commentRepository, videoRepository, cache, commentMQ, popularityMQ)
-	commentHandler := video.NewCommentHandler(commentService, accountService)
 	commentGroup := r.Group("/comment")
 	{
-		commentGroup.POST("/listAll", commentHandler.GetAllComments)
-		commentGroup.POST("/publish", jwt.JWTAuth(tokens), commentLimit, commentIdempotency, commentHandler.PublishComment)
-		commentGroup.POST("/delete", jwt.JWTAuth(tokens), commentHandler.DeleteComment)
+		commentGroup.POST("/listAll", deps.CommentHandler.GetAllComments)
+		commentGroup.POST("/publish", jwt.JWTAuth(tokens), commentLimit, commentIdempotency, deps.CommentHandler.PublishComment)
+		commentGroup.POST("/delete", jwt.JWTAuth(tokens), deps.CommentHandler.DeleteComment)
 	}
 
 	// social
-	socialMQ, err := rabbitmq.NewSocialMQ(rmq)
-	if err != nil {
-		log.Printf("SocialMQ init failed (mq disabled): %v", err)
-		socialMQ = nil
-	}
-	socialRepository := social.NewSocialRepository(db)
-	socialService := social.NewSocialService(socialRepository, accountRepository, socialMQ)
-	socialHandler := social.NewSocialHandler(socialService)
 	socialGroup := r.Group("/social")
 	{
-		socialGroup.POST("/follow", jwt.JWTAuth(tokens), socialLimit, socialHandler.Follow)
-		socialGroup.POST("/unfollow", jwt.JWTAuth(tokens), socialLimit, socialHandler.Unfollow)
-		socialGroup.POST("/getAllFollowers", jwt.SoftJWTAuth(tokens), socialHandler.GetAllFollowers)
-		socialGroup.POST("/getAllVloggers", jwt.SoftJWTAuth(tokens), socialHandler.GetAllVloggers)
+		socialGroup.POST("/follow", jwt.JWTAuth(tokens), socialLimit, deps.SocialHandler.Follow)
+		socialGroup.POST("/unfollow", jwt.JWTAuth(tokens), socialLimit, deps.SocialHandler.Unfollow)
+		socialGroup.POST("/getAllFollowers", jwt.SoftJWTAuth(tokens), deps.SocialHandler.GetAllFollowers)
+		socialGroup.POST("/getAllVloggers", jwt.SoftJWTAuth(tokens), deps.SocialHandler.GetAllVloggers)
 	}
 
 	// feed
-	feedRepository := feed.NewFeedRepository(db)
-	feedService := feed.NewFeedService(
-		feedRepository,
-		likeRepository,
-		cache,
-		timelineredis.NewTimelineRepository(cache),
-		accountmysql.NewCreatorStatsRepository(db),
-	)
-	feedHandler := feed.NewFeedHandler(feedService)
 	feedGroup := r.Group("/feed")
 	{
-		feedGroup.POST("/listLatest", jwt.SoftJWTAuth(tokens), feedLimit, feedHandler.ListLatest)
-		feedGroup.POST("/listLikesCount", jwt.SoftJWTAuth(tokens), feedLimit, feedHandler.ListLikesCount)
-		feedGroup.POST("/listByPopularity", jwt.SoftJWTAuth(tokens), feedLimit, feedHandler.ListByPopularity)
-		feedGroup.POST("/listByFollowing", jwt.JWTAuth(tokens), feedLimit, feedHandler.ListByFollowing)
+		feedGroup.POST("/listLatest", jwt.SoftJWTAuth(tokens), feedLimit, deps.FeedHandler.ListLatest)
+		feedGroup.POST("/listLikesCount", jwt.SoftJWTAuth(tokens), feedLimit, deps.FeedHandler.ListLikesCount)
+		feedGroup.POST("/listByPopularity", jwt.SoftJWTAuth(tokens), feedLimit, deps.FeedHandler.ListByPopularity)
+		feedGroup.POST("/listByFollowing", jwt.JWTAuth(tokens), feedLimit, deps.FeedHandler.ListByFollowing)
 	}
 
-	// worker
-	timelineMQ, err := rabbitmq.NewTimelineMQ(rmq)
-	if err != nil {
-		log.Printf("timelineMQ init failed (mq disabled): %v", err)
-		timelineMQ = nil
-	}
-	if timelineMQ != nil {
-		worker.StartOutboxPoller(db, timelineMQ)
-		worker.StartConsumer(timelineMQ, rabbitmq.TimelineQueueName, cache)
-	}
 	return r
 }
