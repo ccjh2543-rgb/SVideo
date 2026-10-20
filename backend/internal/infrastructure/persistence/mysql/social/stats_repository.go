@@ -1,4 +1,4 @@
-package mysql
+package social
 
 import (
 	"context"
@@ -6,31 +6,31 @@ import (
 	"errors"
 	"time"
 
-	domaincreator "feedsystem_video_go/internal/domain/creator"
+	domainsocial "feedsystem_video_go/internal/domain/social"
 
 	"gorm.io/gorm"
 )
 
-// CreatorStatsRepository 创作者统计仓储的 MySQL 实现。
-type CreatorStatsRepository struct {
+// StatsRepository 创作者统计仓储的 MySQL 实现。
+type StatsRepository struct {
 	db *gorm.DB
 }
 
-// NewCreatorStatsRepository 创建创作者统计仓储。
-func NewCreatorStatsRepository(db *gorm.DB) *CreatorStatsRepository {
-	return &CreatorStatsRepository{db: db}
+// NewStatsRepository 创建创作者统计仓储。
+func NewStatsRepository(db *gorm.DB) *StatsRepository {
+	return &StatsRepository{db: db}
 }
 
 // Get 查询作者统计，不存在时返回默认值。
-func (r *CreatorStatsRepository) Get(ctx context.Context, authorID uint) (*domaincreator.Stats, error) {
-	var model CreatorStatsModel
+func (r *StatsRepository) Get(ctx context.Context, authorID uint) (*domainsocial.Stats, error) {
+	var model StatsModel
 	if err := r.db.WithContext(ctx).First(&model, authorID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return &domaincreator.Stats{AuthorID: authorID}, nil
+			return &domainsocial.Stats{AuthorID: authorID}, nil
 		}
 		return nil, err
 	}
-	stats := &domaincreator.Stats{
+	stats := &domainsocial.Stats{
 		AuthorID:  model.AuthorID,
 		FansCount: model.FansCount,
 		IsBig:     model.IsBig,
@@ -42,7 +42,7 @@ func (r *CreatorStatsRepository) Get(ctx context.Context, authorID uint) (*domai
 }
 
 // UpsertOnPublish 更新作者最后发布时间。
-func (r *CreatorStatsRepository) UpsertOnPublish(ctx context.Context, authorID uint, publishTime time.Time) error {
+func (r *StatsRepository) UpsertOnPublish(ctx context.Context, authorID uint, publishTime time.Time) error {
 	return r.db.WithContext(ctx).Exec(
 		`INSERT INTO creator_stats (author_id, fans_count, is_big, last_publish_time)
 		 VALUES (?, 0, 0, ?)
@@ -52,13 +52,13 @@ func (r *CreatorStatsRepository) UpsertOnPublish(ctx context.Context, authorID u
 }
 
 // IncrementFans 原子增减粉丝数，并同步维护 is_big 标记。
-func (r *CreatorStatsRepository) IncrementFans(ctx context.Context, authorID uint, delta int64) error {
+func (r *StatsRepository) IncrementFans(ctx context.Context, authorID uint, delta int64) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec(
 			`INSERT INTO creator_stats (author_id, fans_count, is_big)
 			 VALUES (?, GREATEST(?, 0), ?)
 			 ON DUPLICATE KEY UPDATE fans_count = GREATEST(fans_count + ?, 0)`,
-			authorID, delta, delta >= domaincreator.BigVFansThreshold, delta,
+			authorID, delta, delta >= domainsocial.BigVFansThreshold, delta,
 		).Error; err != nil {
 			return err
 		}
@@ -66,13 +66,13 @@ func (r *CreatorStatsRepository) IncrementFans(ctx context.Context, authorID uin
 			`UPDATE creator_stats
 			 SET is_big = (fans_count >= ?)
 			 WHERE author_id = ?`,
-			domaincreator.BigVFansThreshold, authorID,
+			domainsocial.BigVFansThreshold, authorID,
 		).Error
 	})
 }
 
 // ListFollowing 查询当前用户关注的全部作者统计。
-func (r *CreatorStatsRepository) ListFollowing(ctx context.Context, followerID uint) ([]*domaincreator.Stats, error) {
+func (r *StatsRepository) ListFollowing(ctx context.Context, followerID uint) ([]*domainsocial.Stats, error) {
 	var rows []struct {
 		AuthorID        uint         `gorm:"column:author_id"`
 		FansCount       int64        `gorm:"column:fans_count"`
@@ -92,9 +92,9 @@ func (r *CreatorStatsRepository) ListFollowing(ctx context.Context, followerID u
 		return nil, err
 	}
 
-	stats := make([]*domaincreator.Stats, 0, len(rows))
+	stats := make([]*domainsocial.Stats, 0, len(rows))
 	for _, row := range rows {
-		item := &domaincreator.Stats{
+		item := &domainsocial.Stats{
 			AuthorID:  row.AuthorID,
 			FansCount: row.FansCount,
 			IsBig:     row.IsBig,

@@ -5,17 +5,17 @@ import (
 	"testing"
 	"time"
 
-	domaincreator "feedsystem_video_go/internal/domain/creator"
 	domainfeed "feedsystem_video_go/internal/domain/feed"
+	domainsocial "feedsystem_video_go/internal/domain/social"
 )
 
 type fakeCreatorRepository struct {
-	stats *domaincreator.Stats
+	stats *domainsocial.Stats
 }
 
-func (f *fakeCreatorRepository) Get(_ context.Context, authorID uint) (*domaincreator.Stats, error) {
+func (f *fakeCreatorRepository) Get(_ context.Context, authorID uint) (*domainsocial.Stats, error) {
 	if f.stats == nil {
-		return &domaincreator.Stats{AuthorID: authorID}, nil
+		return &domainsocial.Stats{AuthorID: authorID}, nil
 	}
 	return f.stats, nil
 }
@@ -28,7 +28,7 @@ func (f *fakeCreatorRepository) IncrementFans(_ context.Context, _ uint, _ int64
 	return nil
 }
 
-func (f *fakeCreatorRepository) ListFollowing(_ context.Context, _ uint) ([]*domaincreator.Stats, error) {
+func (f *fakeCreatorRepository) ListFollowing(_ context.Context, _ uint) ([]*domainsocial.Stats, error) {
 	return nil, nil
 }
 
@@ -96,7 +96,7 @@ func (f *fakeTimelineRepository) RemoveFromInbox(_ context.Context, _ uint, _ []
 func TestFanoutSmallCreatorWritesInboxAndOutbox(t *testing.T) {
 	timeline := newFakeTimelineRepository()
 	service := NewFanoutService(
-		&fakeCreatorRepository{stats: &domaincreator.Stats{AuthorID: 1, FansCount: 3}},
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 3}},
 		&fakeFollowerReader{ids: []uint{2, 3, 4}},
 		timeline,
 		100000,
@@ -121,7 +121,7 @@ func TestFanoutSmallCreatorWritesInboxAndOutbox(t *testing.T) {
 func TestFanoutBigCreatorOnlyWritesOutbox(t *testing.T) {
 	timeline := newFakeTimelineRepository()
 	service := NewFanoutService(
-		&fakeCreatorRepository{stats: &domaincreator.Stats{AuthorID: 1, FansCount: 100001, IsBig: true}},
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 100001, IsBig: true}},
 		&fakeFollowerReader{ids: []uint{2, 3, 4}},
 		timeline,
 		100000,

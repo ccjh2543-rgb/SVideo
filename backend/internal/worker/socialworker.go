@@ -4,10 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"feedsystem_video_go/internal/domain/creator"
 	domainnotification "feedsystem_video_go/internal/domain/notification"
+	domainsocial "feedsystem_video_go/internal/domain/social"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
-	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/util"
 	"log"
 
@@ -18,8 +17,8 @@ import (
 // 它从 RabbitMQ 指定队列中消费 SocialEvent 消息，并调用 SocialRepository 持久化关系。
 type SocialWorker struct {
 	ch       *amqp.Channel
-	repo     *social.SocialRepository
-	creators creator.Repository
+	repo     domainsocial.Repository
+	creators domainsocial.StatsRepository
 	events   EventIdempotency
 	notifier domainnotification.Notifier
 	queue    string
@@ -28,8 +27,8 @@ type SocialWorker struct {
 // NewSocialWorker 创建 SocialWorker 实例。
 func NewSocialWorker(
 	ch *amqp.Channel,
-	repo *social.SocialRepository,
-	creators creator.Repository,
+	repo domainsocial.Repository,
+	creators domainsocial.StatsRepository,
 	events EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
@@ -120,7 +119,7 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 	switch evt.Action {
 	case "follow":
 		// 尝试插入关注关系
-		err := w.repo.Follow(ctx, &social.Social{
+		err := w.repo.Follow(ctx, &domainsocial.Social{
 			FollowerID: evt.FollowerID,
 			VloggerID:  evt.VloggerID,
 		})
@@ -153,7 +152,7 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 
 	case "unfollow":
 		// 尝试删除关注关系，删除成功后减少粉丝数。
-		if err := w.repo.Unfollow(ctx, &social.Social{
+		if err := w.repo.Unfollow(ctx, &domainsocial.Social{
 			FollowerID: evt.FollowerID,
 			VloggerID:  evt.VloggerID,
 		}); err != nil {

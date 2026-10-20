@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	domaincreator "feedsystem_video_go/internal/domain/creator"
 	domainfeed "feedsystem_video_go/internal/domain/feed"
+	domainsocial "feedsystem_video_go/internal/domain/social"
 	domainvideo "feedsystem_video_go/internal/domain/video"
 
 	"golang.org/x/sync/singleflight"
@@ -27,7 +27,7 @@ type FeedService struct {
 	videoCache   VideoCache
 	ranking      RankingCache
 	timelineRepo domainfeed.TimelineRepository
-	creatorRepo  domaincreator.Repository
+	creatorRepo  domainsocial.StatsRepository
 	requestGroup singleflight.Group
 }
 
@@ -38,7 +38,7 @@ func NewFeedService(
 	videoCache VideoCache,
 	ranking RankingCache,
 	timelineRepo domainfeed.TimelineRepository,
-	creatorRepo domaincreator.Repository,
+	creatorRepo domainsocial.StatsRepository,
 ) *FeedService {
 	return &FeedService{
 		repo:         repo,
@@ -343,7 +343,7 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 
 	bigVAuthorIDs := make([]uint, 0)
 	for _, item := range stats {
-		if item.IsBig || item.FansCount >= domaincreator.BigVFansThreshold {
+		if item.IsBig || item.FansCount >= domainsocial.BigVFansThreshold {
 			bigVAuthorIDs = append(bigVAuthorIDs, item.AuthorID)
 		}
 	}

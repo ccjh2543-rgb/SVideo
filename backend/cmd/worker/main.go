@@ -8,10 +8,10 @@ import (
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	socialmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/social"
 	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
-	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/worker"
 	"log"
 	"os"
@@ -159,11 +159,11 @@ func main() {
 	// 5. 创建数据仓库（Repository）实例
 	// ============================================================
 	// 这些 Repository 封装了与数据库的交互逻辑，供 Worker 在处理消息时使用
-	repo := social.NewSocialRepository(sqlDB)
+	repo := socialmysql.NewRepository(sqlDB)
 	videoRepo := videomysql.NewVideoRepository(sqlDB)
 	likeRepo := videomysql.NewLikeRepository(sqlDB)
 	commentRepo := videomysql.NewCommentRepository(sqlDB)
-	creatorRepo := accountmysql.NewCreatorStatsRepository(sqlDB)
+	creatorRepo := socialmysql.NewStatsRepository(sqlDB)
 	processedEvents := accountmysql.NewProcessedEventRepository(sqlDB)
 	notifier := ws.NewRedisNotifier(cache, nil)
 

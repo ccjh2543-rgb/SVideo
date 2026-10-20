@@ -5,9 +5,9 @@ import (
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
 	httpfeed "feedsystem_video_go/internal/interfaces/http/feed"
+	httpsocial "feedsystem_video_go/internal/interfaces/http/social"
 	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
-	"feedsystem_video_go/internal/social"
 )
 
 // Dependencies HTTP 层依赖集合。
@@ -18,7 +18,7 @@ type Dependencies struct {
 	VideoHandler   *httpvideo.VideoHandler
 	LikeHandler    *httpvideo.LikeHandler
 	CommentHandler *httpvideo.CommentHandler
-	SocialHandler  *social.SocialHandler
+	SocialHandler  *httpsocial.SocialHandler
 	FeedHandler    *httpfeed.FeedHandler
 	WSHandler      *ws.Handler
 

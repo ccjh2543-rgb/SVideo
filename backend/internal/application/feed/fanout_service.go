@@ -5,8 +5,8 @@ import (
 	"context"
 	"time"
 
-	domaincreator "feedsystem_video_go/internal/domain/creator"
 	domainfeed "feedsystem_video_go/internal/domain/feed"
+	domainsocial "feedsystem_video_go/internal/domain/social"
 )
 
 const defaultFanoutBatchSize = 500
@@ -16,7 +16,7 @@ const defaultFanoutBatchSize = 500
 // 小 V：向粉丝 Inbox 推送视频 ID。
 // 大 V：只写自己的 Outbox，由粉丝读时拉取。
 type FanoutService struct {
-	creators  domaincreator.Repository
+	creators  domainsocial.StatsRepository
 	followers domainfeed.FollowerReader
 	timeline  domainfeed.TimelineRepository
 	threshold int64
@@ -25,14 +25,14 @@ type FanoutService struct {
 
 // NewFanoutService 创建写扩散服务。
 func NewFanoutService(
-	creators domaincreator.Repository,
+	creators domainsocial.StatsRepository,
 	followers domainfeed.FollowerReader,
 	timeline domainfeed.TimelineRepository,
 	threshold int64,
 	batchSize int,
 ) *FanoutService {
 	if threshold <= 0 {
-		threshold = domaincreator.BigVFansThreshold
+		threshold = domainsocial.BigVFansThreshold
 	}
 	if batchSize <= 0 {
 		batchSize = defaultFanoutBatchSize

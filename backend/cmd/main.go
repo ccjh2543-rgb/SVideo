@@ -9,6 +9,7 @@ import (
 
 	appaccount "feedsystem_video_go/internal/application/account"
 	appfeed "feedsystem_video_go/internal/application/feed"
+	appsocial "feedsystem_video_go/internal/application/social"
 	appvideo "feedsystem_video_go/internal/application/video"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
@@ -20,14 +21,15 @@ import (
 	rabbitmq "feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
 	feedmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/feed"
+	socialmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/social"
 	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/infrastructure/security"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
 	httpfeed "feedsystem_video_go/internal/interfaces/http/feed"
+	httpsocial "feedsystem_video_go/internal/interfaces/http/social"
 	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
-	"feedsystem_video_go/internal/social"
 	"feedsystem_video_go/internal/worker"
 )
 
@@ -183,9 +185,14 @@ func main() {
 		log.Printf("SocialMQ init failed (mq disabled): %v", err)
 		socialMQ = nil
 	}
-	socialRepository := social.NewSocialRepository(sqlDB)
-	socialService := social.NewSocialService(socialRepository, accountRepository, socialMQ)
-	socialHandler := social.NewSocialHandler(socialService)
+	socialRepository := socialmysql.NewRepository(sqlDB)
+	creatorStatsRepository := socialmysql.NewStatsRepository(sqlDB)
+	var socialPublisher appsocial.EventPublisher
+	if socialMQ != nil {
+		socialPublisher = socialMQ
+	}
+	socialService := appsocial.NewSocialService(socialRepository, accountRepository, socialPublisher)
+	socialHandler := httpsocial.NewSocialHandler(socialService)
 
 	// ============================================================
 	// 组合根：Feed
@@ -197,7 +204,7 @@ func main() {
 		feedcache.NewDetailCache(cache),
 		feedcache.NewRankingCache(cache),
 		rediscache.NewTimelineRepository(cache),
-		accountmysql.NewCreatorStatsRepository(sqlDB),
+		creatorStatsRepository,
 	)
 	feedHandler := httpfeed.NewFeedHandler(feedService)
 
