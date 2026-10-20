@@ -8,19 +8,22 @@ import (
 	"time"
 
 	appaccount "feedsystem_video_go/internal/application/account"
+	appfeed "feedsystem_video_go/internal/application/feed"
 	appvideo "feedsystem_video_go/internal/application/video"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
-	"feedsystem_video_go/internal/feed"
 	apphttp "feedsystem_video_go/internal/http"
 	cachelib "feedsystem_video_go/internal/infrastructure/cache"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	feedcache "feedsystem_video_go/internal/infrastructure/cache/redis/feed"
 	videocache "feedsystem_video_go/internal/infrastructure/cache/redis/video"
 	rabbitmq "feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
+	feedmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/feed"
 	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
 	"feedsystem_video_go/internal/infrastructure/security"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	httpfeed "feedsystem_video_go/internal/interfaces/http/feed"
 	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/observability"
@@ -187,15 +190,16 @@ func main() {
 	// ============================================================
 	// 组合根：Feed
 	// ============================================================
-	feedRepository := feed.NewFeedRepository(sqlDB)
-	feedService := feed.NewFeedService(
+	feedRepository := feedmysql.NewRepository(sqlDB)
+	feedService := appfeed.NewFeedService(
 		feedRepository,
 		likeRepository,
-		cache,
+		feedcache.NewDetailCache(cache),
+		feedcache.NewRankingCache(cache),
 		rediscache.NewTimelineRepository(cache),
 		accountmysql.NewCreatorStatsRepository(sqlDB),
 	)
-	feedHandler := feed.NewFeedHandler(feedService)
+	feedHandler := httpfeed.NewFeedHandler(feedService)
 
 	// ============================================================
 	// 组合根：时间线消费者

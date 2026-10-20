@@ -2,9 +2,9 @@ package http
 
 import (
 	domainaccount "feedsystem_video_go/internal/domain/account"
-	"feedsystem_video_go/internal/feed"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
+	httpfeed "feedsystem_video_go/internal/interfaces/http/feed"
 	httpvideo "feedsystem_video_go/internal/interfaces/http/video"
 	"feedsystem_video_go/internal/interfaces/ws"
 	"feedsystem_video_go/internal/social"
@@ -19,7 +19,7 @@ type Dependencies struct {
 	LikeHandler    *httpvideo.LikeHandler
 	CommentHandler *httpvideo.CommentHandler
 	SocialHandler  *social.SocialHandler
-	FeedHandler    *feed.FeedHandler
+	FeedHandler    *httpfeed.FeedHandler
 	WSHandler      *ws.Handler
 
 	Tokens domainaccount.TokenService
