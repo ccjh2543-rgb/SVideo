@@ -81,6 +81,7 @@ export type ListByFollowingResponse = {
   next_time: number
   next_id?: number
   has_more: boolean
+  partial?: boolean
 }
 
 export type IsLikedResponse = {

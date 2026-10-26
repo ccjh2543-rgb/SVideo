@@ -2,6 +2,7 @@ package feed
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 
@@ -50,8 +51,10 @@ func (f *fakeFollowerReader) ListFollowerIDsAfter(_ context.Context, _ uint, aft
 }
 
 type fakeTimelineRepository struct {
-	inbox  map[uint][]domainfeed.TimelineEntry
-	outbox map[uint][]domainfeed.TimelineEntry
+	inbox         map[uint][]domainfeed.TimelineEntry
+	outbox        map[uint][]domainfeed.TimelineEntry
+	readAuthorIDs []uint
+	readDelay     time.Duration
 }
 
 func newFakeTimelineRepository() *fakeTimelineRepository {
@@ -77,16 +80,45 @@ func (f *fakeTimelineRepository) PushOutbox(_ context.Context, authorID uint, vi
 	return nil
 }
 
-func (f *fakeTimelineRepository) ReadInbox(_ context.Context, _ uint, _ int64, _ int) ([]domainfeed.TimelineEntry, error) {
-	return nil, nil
+func (f *fakeTimelineRepository) ReadInbox(_ context.Context, userID uint, maxScore int64, limit int) ([]domainfeed.TimelineEntry, error) {
+	return filterFakeEntries(f.inbox[userID], maxScore, limit), nil
 }
 
-func (f *fakeTimelineRepository) ReadOutbox(_ context.Context, _ uint, _ int64, _ int) ([]domainfeed.TimelineEntry, error) {
-	return nil, nil
+func (f *fakeTimelineRepository) ReadOutbox(_ context.Context, authorID uint, maxScore int64, limit int) ([]domainfeed.TimelineEntry, error) {
+	return filterFakeEntries(f.outbox[authorID], maxScore, limit), nil
 }
 
-func (f *fakeTimelineRepository) ReadOutboxes(_ context.Context, _ []uint, _ int64, _ int) ([][]domainfeed.TimelineEntry, error) {
-	return nil, nil
+func (f *fakeTimelineRepository) ReadOutboxes(_ context.Context, authorIDs []uint, maxScore int64, limit int) ([][]domainfeed.TimelineEntry, error) {
+	if f.readDelay > 0 {
+		time.Sleep(f.readDelay)
+	}
+	f.readAuthorIDs = append(f.readAuthorIDs, authorIDs...)
+	groups := make([][]domainfeed.TimelineEntry, len(authorIDs))
+	for i, authorID := range authorIDs {
+		groups[i] = filterFakeEntries(f.outbox[authorID], maxScore, limit)
+	}
+	return groups, nil
+}
+
+// filterFakeEntries 模拟 Redis ZSet 的读取语义：按 score、ID 倒序，最多返回 limit 条。
+func filterFakeEntries(entries []domainfeed.TimelineEntry, maxScore int64, limit int) []domainfeed.TimelineEntry {
+	result := make([]domainfeed.TimelineEntry, 0, len(entries))
+	for _, entry := range entries {
+		if maxScore > 0 && entry.Score > maxScore {
+			continue
+		}
+		result = append(result, entry)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Score == result[j].Score {
+			return result[i].VideoID > result[j].VideoID
+		}
+		return result[i].Score > result[j].Score
+	})
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result
 }
 
 func (f *fakeTimelineRepository) RemoveFromInbox(_ context.Context, _ uint, _ []uint) error {

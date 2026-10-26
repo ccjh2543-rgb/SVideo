@@ -65,6 +65,8 @@ type ListByFollowingResponse struct {
 	NextTime  int64           `json:"next_time"`
 	NextID    *uint           `json:"next_id,omitempty"`
 	HasMore   bool            `json:"has_more"`
+	// Partial 表示本页因时间预算提前结束，客户端继续翻页即可。
+	Partial bool `json:"partial"`
 }
 
 // ListByPopularityRequest 热度推荐流请求。

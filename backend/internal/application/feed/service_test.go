@@ -1,10 +1,12 @@
 package feed
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	domainfeed "feedsystem_video_go/internal/domain/feed"
+	domainsocial "feedsystem_video_go/internal/domain/social"
 	domainvideo "feedsystem_video_go/internal/domain/video"
 )
 
@@ -133,5 +135,158 @@ func TestFilterVideosByAuthors(t *testing.T) {
 	}
 	if got[0].ID != 1 || got[1].ID != 3 {
 		t.Fatalf("unexpected videos: %+v", got)
+	}
+}
+
+func bigVStats(authorID uint, lastPublishMs int64) *domainsocial.Stats {
+	stats := &domainsocial.Stats{
+		AuthorID:  authorID,
+		IsBig:     true,
+		FansCount: domainsocial.BigVFansThreshold,
+	}
+	if lastPublishMs > 0 {
+		stats.LastPublishTime = time.UnixMilli(lastPublishMs)
+	}
+	return stats
+}
+
+func TestMergeBigVOutboxesPrunesInactiveAuthors(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	stats := make([]*domainsocial.Stats, 0, 300)
+	stats = append(stats, bigVStats(1, 2000), bigVStats(2, 1999))
+	for i := 0; i < 298; i++ {
+		stats = append(stats, bigVStats(uint(i+3), 100))
+	}
+	timeline.outbox[1] = []domainfeed.TimelineEntry{{VideoID: 1, Score: 2000}, {VideoID: 2, Score: 1900}}
+	timeline.outbox[2] = []domainfeed.TimelineEntry{{VideoID: 3, Score: 1900}}
+	timeline.outbox[3] = []domainfeed.TimelineEntry{{VideoID: 4, Score: 100}}
+
+	service := &FeedService{
+		timelineRepo:    timeline,
+		bigVBatchSize:   32,
+		bigVMergeBudget: time.Second,
+	}
+	entries, unreadUpper, partial, err := service.mergeBigVOutboxes(context.Background(), stats, 0, 0, 3)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	if partial {
+		t.Fatal("should stop by pruning, not budget")
+	}
+	if unreadUpper != -1 {
+		t.Fatalf("expected no watermark, got %d", unreadUpper)
+	}
+	if len(timeline.readAuthorIDs) > 32 {
+		t.Fatalf("inactive authors should be pruned, read %d authors", len(timeline.readAuthorIDs))
+	}
+	seen := make(map[uint]bool, len(entries))
+	for _, entry := range entries {
+		seen[entry.VideoID] = true
+	}
+	for _, want := range []uint{1, 2, 3} {
+		if !seen[want] {
+			t.Fatalf("missing video %d in %+v", want, entries)
+		}
+	}
+}
+
+func TestMergeBigVOutboxesKeepsTieAuthors(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	// authorID 2 排在前面，但它只有 videoID=5；authorID 1 的同分 videoID=9 更大。
+	timeline.outbox[2] = []domainfeed.TimelineEntry{{VideoID: 5, Score: 1000}}
+	timeline.outbox[1] = []domainfeed.TimelineEntry{{VideoID: 9, Score: 1000}}
+
+	service := &FeedService{
+		timelineRepo:    timeline,
+		bigVBatchSize:   1,
+		bigVMergeBudget: time.Second,
+	}
+	entries, _, partial, err := service.mergeBigVOutboxes(
+		context.Background(),
+		[]*domainsocial.Stats{bigVStats(2, 1000), bigVStats(1, 1000)},
+		0,
+		0,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if partial {
+		t.Fatal("unexpected partial")
+	}
+	if len(entries) != 1 || entries[0].VideoID != 9 {
+		t.Fatalf("same-score authors must both be read, got %+v", entries)
+	}
+	if len(timeline.readAuthorIDs) != 2 {
+		t.Fatalf("expected both authors read, got %v", timeline.readAuthorIDs)
+	}
+}
+
+func TestMergeBigVOutboxesReadsUnknownPublishTime(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	timeline.outbox[1] = []domainfeed.TimelineEntry{{VideoID: 1, Score: 100}}
+	timeline.outbox[2] = []domainfeed.TimelineEntry{{VideoID: 2, Score: 1000}}
+
+	service := &FeedService{
+		timelineRepo:    timeline,
+		bigVBatchSize:   1,
+		bigVMergeBudget: time.Second,
+	}
+	entries, _, _, err := service.mergeBigVOutboxes(
+		context.Background(),
+		[]*domainsocial.Stats{bigVStats(1, 0), bigVStats(2, 1000)},
+		0,
+		0,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(entries) != 1 || entries[0].VideoID != 2 {
+		t.Fatalf("unexpected entries: %+v", entries)
+	}
+	if len(timeline.readAuthorIDs) == 0 || timeline.readAuthorIDs[0] != 1 {
+		t.Fatalf("unknown publish time author must be read first, got %v", timeline.readAuthorIDs)
+	}
+}
+
+func TestMergeBigVOutboxesBudgetWatermark(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	timeline.outbox[1] = []domainfeed.TimelineEntry{{VideoID: 1, Score: 3000}}
+	timeline.outbox[2] = []domainfeed.TimelineEntry{{VideoID: 2, Score: 2000}}
+	timeline.outbox[3] = []domainfeed.TimelineEntry{{VideoID: 3, Score: 1000}}
+
+	service := &FeedService{
+		timelineRepo:    timeline,
+		bigVBatchSize:   1,
+		bigVMergeBudget: time.Millisecond,
+	}
+	timeline.readDelay = 2 * time.Millisecond
+	entries, unreadUpper, partial, err := service.mergeBigVOutboxes(
+		context.Background(),
+		[]*domainsocial.Stats{bigVStats(1, 3000), bigVStats(2, 2000), bigVStats(3, 1000)},
+		0,
+		0,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !partial {
+		t.Fatal("expected partial result when budget is exhausted")
+	}
+	if unreadUpper != 2000 {
+		t.Fatalf("expected watermark 2000, got %d", unreadUpper)
+	}
+	if len(entries) != 1 || entries[0].Score != 3000 {
+		t.Fatalf("unexpected entries: %+v", entries)
+	}
+
+	safe := filterEntriesAbove(entries, unreadUpper)
+	if len(safe) != 1 || safe[0].Score != 3000 {
+		t.Fatalf("watermark filter should keep only score > 2000, got %+v", safe)
 	}
 }

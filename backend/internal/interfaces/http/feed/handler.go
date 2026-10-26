@@ -166,6 +166,7 @@ func (h *FeedHandler) ListByFollowing(c *gin.Context) {
 		NextTime:  result.NextTime,
 		NextID:    result.NextID,
 		HasMore:   result.HasMore,
+		Partial:   result.Partial,
 	})
 }
 

@@ -13,10 +13,19 @@ import (
 )
 
 const (
-	inboxMaxSize  int64 = 500
-	outboxMaxSize int64 = 100
+	// Inbox 与 Outbox 是热缓存而不是全量存储：
+	// 超过容量的历史内容由数据库游标查询兜底，不能再从 Outbox 反查。
+	inboxMaxSize  int64 = 300
+	outboxMaxSize int64 = 50
 	timelineTTL         = 7 * 24 * time.Hour
 )
+
+// timelineMember 把 videoID 编码成固定 20 位十进制字符串。
+// Redis 对相同 score 的 member 按字典序排序，未补零时 "9" > "10"，
+// 会导致同毫秒视频的 ID 倒序与数字序不一致。
+func timelineMember(videoID uint) string {
+	return fmt.Sprintf("%020d", videoID)
+}
 
 // TimelineRepository 推拉结合时间线的 Redis 实现。
 type TimelineRepository struct {
@@ -38,7 +47,7 @@ func (r *TimelineRepository) PushInboxBatch(ctx context.Context, followerIDs []u
 	if len(followerIDs) == 0 {
 		return nil
 	}
-	member := strconv.FormatUint(uint64(videoID), 10)
+	member := timelineMember(videoID)
 	entries := make(map[string][]goredis.Z, len(followerIDs))
 	for _, followerID := range followerIDs {
 		key := inboxKey(followerID)
@@ -51,7 +60,7 @@ func (r *TimelineRepository) PushInboxBatch(ctx context.Context, followerIDs []u
 func (r *TimelineRepository) PushOutbox(ctx context.Context, authorID uint, videoID uint, score int64) error {
 	key := outboxKey(authorID)
 	return r.cache.ZAddManyWithTrim(ctx, map[string][]goredis.Z{
-		key: {{Score: float64(score), Member: strconv.FormatUint(uint64(videoID), 10)}},
+		key: {{Score: float64(score), Member: timelineMember(videoID)}},
 	}, 0, -outboxMaxSize-1, timelineTTL)
 }
 
@@ -100,7 +109,7 @@ func (r *TimelineRepository) RemoveFromInbox(ctx context.Context, followerID uin
 	}
 	members := make([]string, len(videoIDs))
 	for i, videoID := range videoIDs {
-		members[i] = strconv.FormatUint(uint64(videoID), 10)
+		members[i] = timelineMember(videoID)
 	}
 	return r.cache.ZRem(ctx, inboxKey(followerID), members...)
 }

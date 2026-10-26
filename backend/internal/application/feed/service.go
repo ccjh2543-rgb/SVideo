@@ -2,10 +2,12 @@
 package feed
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -28,6 +30,10 @@ const (
 	breakerRedisFeed = "redis-feed"
 	// breakerRedisPopularity 热榜 Redis 熔断器名称。
 	breakerRedisPopularity = "redis-popularity"
+	// defaultBigVBatchSize 大 V Outbox 单批读取数量。
+	defaultBigVBatchSize = 32
+	// defaultBigVMergeBudget 大 V 归并的时间预算。
+	defaultBigVMergeBudget = 50 * time.Millisecond
 )
 
 // errTimelineEmpty 表示时间线中没有任何可用数据，需要回源数据库。
@@ -42,16 +48,18 @@ var errCircuitOpen = errors.New("dependency circuit is open")
 //
 //	L1 本地内存（3s）→ L2 Redis → L3 MySQL（SingleFlight 防击穿）
 type FeedService struct {
-	repo           domainfeed.FeedRepository
-	likeRepo       domainvideo.LikeRepository
-	videoCache     VideoCache
-	ranking        RankingCache
-	timelineRepo   domainfeed.TimelineRepository
-	creatorRepo    domainsocial.StatsRepository
-	followingCache FollowingCache
-	guard          DependencyGuard
-	dbFallback     chan struct{}
-	requestGroup   singleflight.Group
+	repo            domainfeed.FeedRepository
+	likeRepo        domainvideo.LikeRepository
+	videoCache      VideoCache
+	ranking         RankingCache
+	timelineRepo    domainfeed.TimelineRepository
+	creatorRepo     domainsocial.StatsRepository
+	followingCache  FollowingCache
+	guard           DependencyGuard
+	dbFallback      chan struct{}
+	bigVBatchSize   int
+	bigVMergeBudget time.Duration
+	requestGroup    singleflight.Group
 }
 
 // NewFeedService 创建 Feed 应用服务。
@@ -66,15 +74,17 @@ func NewFeedService(
 	guard DependencyGuard,
 ) *FeedService {
 	return &FeedService{
-		repo:           repo,
-		likeRepo:       likeRepo,
-		videoCache:     videoCache,
-		ranking:        ranking,
-		timelineRepo:   timelineRepo,
-		creatorRepo:    creatorRepo,
-		followingCache: followingCache,
-		guard:          guard,
-		dbFallback:     make(chan struct{}, dbFallbackConcurrency),
+		repo:            repo,
+		likeRepo:        likeRepo,
+		videoCache:      videoCache,
+		ranking:         ranking,
+		timelineRepo:    timelineRepo,
+		creatorRepo:     creatorRepo,
+		followingCache:  followingCache,
+		guard:           guard,
+		dbFallback:      make(chan struct{}, dbFallbackConcurrency),
+		bigVBatchSize:   defaultBigVBatchSize,
+		bigVMergeBudget: defaultBigVMergeBudget,
 	}
 }
 
@@ -432,7 +442,7 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		return FollowingResult{}, err
 	}
 
-	bigVAuthorIDs := make([]uint, 0)
+	bigVStats := make([]*domainsocial.Stats, 0)
 	// allowedAuthors 既用于挑选大 V，也用于读时过滤：
 	// 取关后 Inbox 里可能残留旧视频，按当前关注集合过滤可以立即生效。
 	allowedAuthors := make(map[uint]struct{}, len(stats)+1)
@@ -443,13 +453,8 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		}
 		allowedAuthors[item.AuthorID] = struct{}{}
 		if item.IsBig || item.FansCount >= domainsocial.BigVFansThreshold {
-			bigVAuthorIDs = append(bigVAuthorIDs, item.AuthorID)
+			bigVStats = append(bigVStats, item)
 		}
-	}
-	// 限制单次合并的大 V 数量，避免关注几百个大 V 时读放大失控
-	const maxBigVAuthors = 100
-	if len(bigVAuthorIDs) > maxBigVAuthors {
-		bigVAuthorIDs = bigVAuthorIDs[:maxBigVAuthors]
 	}
 
 	// 多取 50 条，覆盖同一毫秒发布多条视频的情况
@@ -459,16 +464,6 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		s.recordDependency(breakerRedisFeed, err)
 		return FollowingResult{}, err
 	}
-	if len(bigVAuthorIDs) > 0 {
-		groups, err := s.timelineRepo.ReadOutboxes(ctx, bigVAuthorIDs, cursorMs, readLimit)
-		if err != nil {
-			s.recordDependency(breakerRedisFeed, err)
-			return FollowingResult{}, err
-		}
-		for _, group := range groups {
-			entries = append(entries, group...)
-		}
-	}
 
 	ownEntries, err := s.timelineRepo.ReadOutbox(ctx, viewerAccountID, cursorMs, readLimit)
 	if err != nil {
@@ -476,13 +471,24 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		return FollowingResult{}, err
 	}
 	entries = append(entries, ownEntries...)
-	s.recordDependency(breakerRedisFeed, nil)
 
+	// 大 V 数量不设上限：按上界排序、分批读取、预算用尽时用水位线保证不跨过未读数据。
+	bigVEntries, unreadUpper, partial, err := s.mergeBigVOutboxes(ctx, bigVStats, cursorMs, latestID, limit)
+	if err != nil {
+		s.recordDependency(breakerRedisFeed, err)
+		return FollowingResult{}, err
+	}
+	s.recordDependency(breakerRedisFeed, nil)
+	entries = append(entries, bigVEntries...)
+
+	if partial {
+		entries = filterEntriesAbove(entries, unreadUpper)
+	}
 	entries = filterTimelineEntries(entries, cursorMs, latestID)
 	merged := mergeTimelineEntries(entries, limit)
 	if len(merged) == 0 {
 		// 第一页为空可能是新用户或缓存被清空；
-		// 非第一页为空可能是 Inbox 已被裁剪到 500 条。
+		// 非第一页为空可能是 Inbox 已被裁剪。
 		// 交给外层回源数据库，避免静默返回“没有更多”。
 		return FollowingResult{}, errTimelineEmpty
 	}
@@ -505,12 +511,21 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		return FollowingResult{}, err
 	}
 
+	// 预算截断时用数据库补齐本页，避免返回过小的页；未截断时保持纯 Redis 结果。
+	hasMore := len(items) == limit || partial
+	if partial && len(items) < limit {
+		items, hasMore, err = s.fillFollowingFromDB(ctx, items, limit, viewerAccountID)
+		if err != nil {
+			return FollowingResult{}, err
+		}
+	}
+
 	var nextTime int64
 	var nextID *uint
 	if len(items) > 0 {
 		// 游标取本页最后一条视频的毫秒发布时间与 ID，前端下次原样回传。
-		last := videos[len(videos)-1]
-		nextTime = last.CreateTime.UnixMilli()
+		last := items[len(items)-1]
+		nextTime = last.CreateTimeMs
 		id := last.ID
 		nextID = &id
 	}
@@ -518,8 +533,238 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		VideoList: items,
 		NextTime:  nextTime,
 		NextID:    nextID,
-		HasMore:   len(items) == limit,
+		HasMore:   hasMore,
+		Partial:   partial,
 	}, nil
+}
+
+// mergeBigVOutboxes 按 (score, videoID) 归并所有大 V 的 Outbox。
+//
+// 返回：
+//   - entries：读到的大 V 视频；
+//   - unreadUpper：未读作者中最大的上界，-1 表示没有未读作者；
+//   - partial：是否因时间预算提前结束。
+//
+// 只要 partial=true，调用方必须丢弃 score <= unreadUpper 的结果，
+// 否则这些结果可能被未读作者顶掉，导致游标跨过未读数据。
+func (s *FeedService) mergeBigVOutboxes(
+	ctx context.Context,
+	stats []*domainsocial.Stats,
+	cursorMs int64,
+	cursorID uint,
+	limit int,
+) ([]domainfeed.TimelineEntry, int64, bool, error) {
+	if len(stats) == 0 || limit <= 0 {
+		return nil, -1, false, nil
+	}
+
+	type authorBound struct {
+		authorID uint
+		upper    int64
+	}
+	authors := make([]authorBound, 0, len(stats))
+	for _, item := range stats {
+		if item == nil || item.AuthorID == 0 {
+			continue
+		}
+		// 上界取 min(最后发布时间, 当前游标)；未知发布时间按 +inf 处理，强制读取。
+		upper := int64(math.MaxInt64)
+		if !item.LastPublishTime.IsZero() {
+			upper = item.LastPublishTime.UnixMilli()
+		}
+		if cursorMs > 0 && upper > cursorMs {
+			upper = cursorMs
+		}
+		authors = append(authors, authorBound{authorID: item.AuthorID, upper: upper})
+	}
+	if len(authors) == 0 {
+		return nil, -1, false, nil
+	}
+	sort.Slice(authors, func(i, j int) bool {
+		if authors[i].upper == authors[j].upper {
+			return authors[i].authorID > authors[j].authorID
+		}
+		return authors[i].upper > authors[j].upper
+	})
+
+	batchSize := s.bigVBatchSize
+	if batchSize <= 0 {
+		batchSize = defaultBigVBatchSize
+	}
+	budget := s.bigVMergeBudget
+	if budget <= 0 {
+		budget = defaultBigVMergeBudget
+	}
+	deadline := time.Now().Add(budget)
+
+	h := &timelineEntryHeap{}
+	heap.Init(h)
+	// 每个作者最多读 limit+50 条，覆盖同毫秒分组；堆容量仍是 limit。
+	perAuthorLimit := limit + 50
+
+	for start := 0; start < len(authors); {
+		end := start + batchSize
+		if end > len(authors) {
+			end = len(authors)
+		}
+		authorIDs := make([]uint, 0, end-start)
+		for _, author := range authors[start:end] {
+			authorIDs = append(authorIDs, author.authorID)
+		}
+
+		groups, err := s.timelineRepo.ReadOutboxes(ctx, authorIDs, cursorMs, perAuthorLimit)
+		if err != nil {
+			if ctx.Err() != nil {
+				return heapEntries(h), authors[start].upper, true, nil
+			}
+			return nil, -1, false, err
+		}
+		for _, group := range groups {
+			for _, entry := range group {
+				if !entryAfterCursor(entry, cursorMs, cursorID) {
+					continue
+				}
+				heapPushLimited(h, entry, limit)
+			}
+		}
+		start = end
+
+		nextUpper := int64(-1)
+		if start < len(authors) {
+			nextUpper = authors[start].upper
+		}
+		// 严格小于才能剪枝：上界相同还要比较 videoID。
+		if h.Len() == limit && nextUpper >= 0 && nextUpper < h.topScore() {
+			return heapEntries(h), -1, false, nil
+		}
+		if time.Now().After(deadline) {
+			if start < len(authors) {
+				return heapEntries(h), authors[start].upper, true, nil
+			}
+			return heapEntries(h), -1, false, nil
+		}
+	}
+	return heapEntries(h), -1, false, nil
+}
+
+// fillFollowingFromDB 用数据库补齐预算截断后的页面。
+func (s *FeedService) fillFollowingFromDB(ctx context.Context, items []FeedItem, limit int, viewerAccountID uint) ([]FeedItem, bool, error) {
+	if len(items) >= limit {
+		return items, true, nil
+	}
+
+	var before time.Time
+	var beforeID uint
+	if len(items) > 0 {
+		last := items[len(items)-1]
+		if last.CreateTimeMs > 0 {
+			before = time.UnixMilli(last.CreateTimeMs)
+		}
+		beforeID = last.ID
+	}
+
+	result, err := s.listByFollowingFromDBGuarded(ctx, limit-len(items), before, beforeID, viewerAccountID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	seen := make(map[uint]struct{}, len(items)+len(result.VideoList))
+	for _, item := range items {
+		seen[item.ID] = struct{}{}
+	}
+	for _, item := range result.VideoList {
+		if _, ok := seen[item.ID]; ok {
+			continue
+		}
+		items = append(items, item)
+		if len(items) >= limit {
+			break
+		}
+	}
+	hasMore := result.HasMore || len(items) >= limit
+	return items, hasMore, nil
+}
+
+// entryAfterCursor 判断时间线条目是否严格位于双游标之后。
+func entryAfterCursor(entry domainfeed.TimelineEntry, cursorMs int64, cursorID uint) bool {
+	if cursorMs <= 0 {
+		return true
+	}
+	if entry.Score < cursorMs {
+		return true
+	}
+	return entry.Score == cursorMs && cursorID > 0 && entry.VideoID < cursorID
+}
+
+// filterEntriesAbove 只保留 score 严格大于水位线的条目。
+// 水位线以下的条目可能被未读作者顶掉，不能安全返回。
+func filterEntriesAbove(entries []domainfeed.TimelineEntry, watermark int64) []domainfeed.TimelineEntry {
+	if watermark < 0 {
+		return entries
+	}
+	filtered := make([]domainfeed.TimelineEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Score > watermark {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+// timelineEntryHeap 小顶堆：堆顶是当前前 limit 名中最差的一条。
+type timelineEntryHeap []domainfeed.TimelineEntry
+
+// Len 返回堆大小。
+func (h timelineEntryHeap) Len() int { return len(h) }
+
+// Less 按 (score, videoID) 升序比较，堆顶最小。
+func (h timelineEntryHeap) Less(i, j int) bool {
+	if h[i].Score == h[j].Score {
+		return h[i].VideoID < h[j].VideoID
+	}
+	return h[i].Score < h[j].Score
+}
+
+// Swap 交换堆元素。
+func (h timelineEntryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+// Push 入堆。
+func (h *timelineEntryHeap) Push(value interface{}) {
+	*h = append(*h, value.(domainfeed.TimelineEntry))
+}
+
+// Pop 出堆。
+func (h *timelineEntryHeap) Pop() interface{} {
+	old := *h
+	last := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return last
+}
+
+// topScore 返回堆顶 score。
+func (h *timelineEntryHeap) topScore() int64 {
+	if len(*h) == 0 {
+		return math.MinInt64
+	}
+	return (*h)[0].Score
+}
+
+// heapPushLimited 维持容量为 limit 的小顶堆。
+func heapPushLimited(h *timelineEntryHeap, entry domainfeed.TimelineEntry, limit int) {
+	heap.Push(h, entry)
+	if h.Len() > limit {
+		heap.Pop(h)
+	}
+}
+
+// heapEntries 返回堆内条目副本。
+func heapEntries(h *timelineEntryHeap) []domainfeed.TimelineEntry {
+	if h == nil || len(*h) == 0 {
+		return nil
+	}
+	result := make([]domainfeed.TimelineEntry, len(*h))
+	copy(result, *h)
+	return result
 }
 
 // recordDependency 记录依赖调用结果，供熔断器统计。
@@ -776,16 +1021,17 @@ func (s *FeedService) buildFeedItems(ctx context.Context, videos []*domainvideo.
 
 	for _, video := range videos {
 		items = append(items, FeedItem{
-			ID:          video.ID,
-			AuthorID:    video.AuthorID,
-			AuthorName:  video.Username,
-			Title:       video.Title,
-			Description: video.Description,
-			PlayURL:     video.PlayURL,
-			CoverURL:    video.CoverURL,
-			CreateTime:  video.CreateTime.Unix(),
-			LikesCount:  video.LikesCount,
-			IsLiked:     likedMap[video.ID],
+			ID:           video.ID,
+			AuthorID:     video.AuthorID,
+			AuthorName:   video.Username,
+			Title:        video.Title,
+			Description:  video.Description,
+			PlayURL:      video.PlayURL,
+			CoverURL:     video.CoverURL,
+			CreateTime:   video.CreateTime.Unix(),
+			CreateTimeMs: video.CreateTime.UnixMilli(),
+			LikesCount:   video.LikesCount,
+			IsLiked:      likedMap[video.ID],
 		})
 	}
 	return items, nil

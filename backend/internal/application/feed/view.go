@@ -5,16 +5,17 @@ import "time"
 // FeedItem 视频流卡片展示模型。
 // 只包含前端需要的字段，不暴露账号敏感信息；JSON 序列化由接口层 DTO 负责。
 type FeedItem struct {
-	ID          uint
-	AuthorID    uint
-	AuthorName  string
-	Title       string
-	Description string
-	PlayURL     string
-	CoverURL    string
-	CreateTime  int64 // 秒级时间戳
-	LikesCount  int64
-	IsLiked     bool
+	ID           uint
+	AuthorID     uint
+	AuthorName   string
+	Title        string
+	Description  string
+	PlayURL      string
+	CoverURL     string
+	CreateTime   int64 // 秒级时间戳，供前端展示
+	CreateTimeMs int64 // 毫秒级时间戳，供服务端游标使用
+	LikesCount   int64
+	IsLiked      bool
 }
 
 // LatestResult 最新视频流结果。
@@ -39,6 +40,8 @@ type FollowingResult struct {
 	NextTime  int64 // 毫秒时间戳
 	NextID    *uint // 与 NextTime 组成双游标，保证同一毫秒翻页不重不漏
 	HasMore   bool
+	// Partial 表示本页因时间预算提前结束，客户端继续翻页即可。
+	Partial bool
 }
 
 // PopularityResult 热度推荐流结果。
