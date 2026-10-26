@@ -54,21 +54,27 @@ func (r *StatsRepository) UpsertOnPublish(ctx context.Context, authorID uint, pu
 // IncrementFans 原子增减粉丝数，并同步维护 is_big 标记。
 func (r *StatsRepository) IncrementFans(ctx context.Context, authorID uint, delta int64) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(
-			`INSERT INTO creator_stats (author_id, fans_count, is_big)
-			 VALUES (?, GREATEST(?, 0), ?)
-			 ON DUPLICATE KEY UPDATE fans_count = GREATEST(fans_count + ?, 0)`,
-			authorID, delta, delta >= domainsocial.BigVFansThreshold, delta,
-		).Error; err != nil {
-			return err
-		}
-		return tx.Exec(
-			`UPDATE creator_stats
-			 SET is_big = (fans_count >= ?)
-			 WHERE author_id = ?`,
-			domainsocial.BigVFansThreshold, authorID,
-		).Error
+		return upsertFans(tx, authorID, delta)
 	})
+}
+
+// upsertFans 在给定事务内增减粉丝数并刷新 is_big。
+// 供关注关系的事务化写入复用，保证 socials 与 creator_stats 同时生效。
+func upsertFans(tx *gorm.DB, authorID uint, delta int64) error {
+	if err := tx.Exec(
+		`INSERT INTO creator_stats (author_id, fans_count, is_big)
+		 VALUES (?, GREATEST(?, 0), ?)
+		 ON DUPLICATE KEY UPDATE fans_count = GREATEST(fans_count + ?, 0)`,
+		authorID, delta, delta >= domainsocial.BigVFansThreshold, delta,
+	).Error; err != nil {
+		return err
+	}
+	return tx.Exec(
+		`UPDATE creator_stats
+		 SET is_big = (fans_count >= ?)
+		 WHERE author_id = ?`,
+		domainsocial.BigVFansThreshold, authorID,
+	).Error
 }
 
 // ListFollowing 查询当前用户关注的全部作者统计。

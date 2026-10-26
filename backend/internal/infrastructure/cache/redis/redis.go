@@ -20,6 +20,14 @@ func NewFromEnv(cfg *config.RedisConfig) (*Client, error) {
 		Addr:     cfg.Host + ":" + strconv.Itoa(cfg.Port),
 		Password: cfg.Password,
 		DB:       cfg.DB,
+		// 显式设置超时：Redis 故障时必须快速失败，交给上层降级/熔断。
+		// 默认值是秒级，会把一次关注流请求拖到数秒。
+		DialTimeout:  1 * time.Second,
+		ReadTimeout:  50 * time.Millisecond,
+		WriteTimeout: 50 * time.Millisecond,
+		PoolTimeout:  100 * time.Millisecond,
+		// 只重试 1 次，避免“超时 × 重试次数”放大尾延迟。
+		MaxRetries: 1,
 	})
 	return &Client{rdb: rdb}, nil
 }

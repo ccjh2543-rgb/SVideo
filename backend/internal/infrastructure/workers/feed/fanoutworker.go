@@ -82,5 +82,14 @@ func (w *FanoutWorker) process(ctx context.Context, body []byte) error {
 			return nil
 		}
 	}
-	return w.service.Handle(ctx, event.VideoID, event.AuthorID, time.UnixMilli(event.CreateTime))
+	if err := w.service.Handle(ctx, event.VideoID, event.AuthorID, time.UnixMilli(event.CreateTime)); err != nil {
+		// 业务失败时删除幂等标记，保证 DLQ 重放或补偿任务能够重新处理。
+		if w.events != nil {
+			if unmarkErr := w.events.Unmark(ctx, "fanout", event.EventID); unmarkErr != nil {
+				log.Printf("fanout worker: unmark failed event_id=%s: %v", event.EventID, unmarkErr)
+			}
+		}
+		return err
+	}
+	return nil
 }

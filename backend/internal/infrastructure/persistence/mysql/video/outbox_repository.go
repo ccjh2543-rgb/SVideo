@@ -57,3 +57,21 @@ func (r *OutboxRepository) MarkRetry(
 	}
 	return r.db.WithContext(ctx).Model(&OutboxModel{}).Where("id = ?", id).Updates(updates).Error
 }
+
+// RequeueFailed 把失败消息重新置为待投递。
+// 只处理创建时间早于 olderThan 的记录，避免刚失败的消息立即被反复重投。
+func (r *OutboxRepository) RequeueFailed(ctx context.Context, olderThan time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	result := r.db.WithContext(ctx).
+		Model(&OutboxModel{}).
+		Where("status = ? AND create_time < ?", "failed", olderThan).
+		Limit(limit).
+		Updates(map[string]interface{}{
+			"status":      "pending",
+			"retry_count": 0,
+			"next_retry":  nil,
+		})
+	return result.RowsAffected, result.Error
+}

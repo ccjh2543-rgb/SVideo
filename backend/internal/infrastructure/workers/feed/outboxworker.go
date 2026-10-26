@@ -8,6 +8,7 @@ import (
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -58,7 +59,9 @@ func (p *OutboxPoller) poll(ctx context.Context) {
 	}
 
 	for _, msg := range messages {
-		err := p.tmq.PublishVideo(context.Background(), msg.VideoID, msg.AuthorID, msg.CreateTime)
+		// 使用 outbox 消息 ID 作为事件 ID：重复投递时消费端幂等表可以拦截。
+		eventID := strconv.FormatUint(uint64(msg.ID), 10)
+		err := p.tmq.PublishVideo(context.Background(), eventID, msg.VideoID, msg.AuthorID, msg.CreateTime)
 		if err == nil {
 			_ = p.outbox.Delete(ctx, msg.ID)
 			continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	domainfeed "feedsystem_video_go/internal/domain/feed"
 	domainnotification "feedsystem_video_go/internal/domain/notification"
 	domainsocial "feedsystem_video_go/internal/domain/social"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
@@ -14,27 +15,43 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// FollowingCacheInvalidator 关注列表缓存失效接口。
+// 关注关系变化后清理缓存，避免关注流继续读到旧数据。
+type FollowingCacheInvalidator interface {
+	Invalidate(ctx context.Context, followerID uint) error
+}
+
 // SocialWorker 是处理社交关系（关注/取关）的消费者 Worker。
 // 它从 RabbitMQ 指定队列中消费 SocialEvent 消息，并调用 SocialRepository 持久化关系。
 type SocialWorker struct {
-	ch       *amqp.Channel
-	repo     domainsocial.Repository
-	creators domainsocial.StatsRepository
-	events   workers.EventIdempotency
-	notifier domainnotification.Notifier
-	queue    string
+	ch             *amqp.Channel
+	repo           domainsocial.Repository
+	timeline       domainfeed.TimelineRepository
+	followingCache FollowingCacheInvalidator
+	events         workers.EventIdempotency
+	notifier       domainnotification.Notifier
+	queue          string
 }
 
 // NewSocialWorker 创建 SocialWorker 实例。
 func NewSocialWorker(
 	ch *amqp.Channel,
 	repo domainsocial.Repository,
-	creators domainsocial.StatsRepository,
+	timeline domainfeed.TimelineRepository,
+	followingCache FollowingCacheInvalidator,
 	events workers.EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
 ) *SocialWorker {
-	return &SocialWorker{ch: ch, repo: repo, creators: creators, events: events, notifier: notifier, queue: queue}
+	return &SocialWorker{
+		ch:             ch,
+		repo:           repo,
+		timeline:       timeline,
+		followingCache: followingCache,
+		events:         events,
+		notifier:       notifier,
+		queue:          queue,
+	}
 }
 
 // Run 启动 Worker，开始消费消息并处理，直到 ctx 被取消或发生不可恢复的错误。
@@ -117,55 +134,100 @@ func (w *SocialWorker) process(ctx context.Context, body []byte) error {
 	}
 
 	// 根据事件中的 Action 字段分发业务逻辑
+	var err error
 	switch evt.Action {
 	case "follow":
-		// 尝试插入关注关系
-		err := w.repo.Follow(ctx, &domainsocial.Social{
-			FollowerID: evt.FollowerID,
-			VloggerID:  evt.VloggerID,
-		})
-		if err == nil {
-			// 只有真正新增关注关系时才增加粉丝数，重复消息不会重复计数。
-			if w.creators != nil {
-				if err := w.creators.IncrementFans(ctx, evt.VloggerID, 1); err != nil {
-					return err
-				}
-			}
-			if w.notifier != nil {
-				_ = w.notifier.Publish(ctx, domainnotification.Event{
-					EventID:   evt.EventID,
-					AccountID: evt.VloggerID,
-					Type:      "follow",
-					Title:     "有新的粉丝",
-					Body:      "有人关注了你",
-					Data:      map[string]any{"follower_id": evt.FollowerID},
-				})
-			}
-			return nil
-		}
-		// 处理 MySQL 重复键错误（Error 1062: Duplicate entry）
-		// 关注关系存在是幂等场景，不应视为错误，直接忽略
-		if util.IsDuplicateEntry(err) {
-			return nil // 重复关注，视为成功，不重试
-		}
-		// 其他数据库错误（连接问题、死锁等），返回错误触发 Nack 重新入队重试
-		return err
-
+		err = w.applyFollow(ctx, &evt)
 	case "unfollow":
-		// 尝试删除关注关系，删除成功后减少粉丝数。
-		if err := w.repo.Unfollow(ctx, &domainsocial.Social{
-			FollowerID: evt.FollowerID,
-			VloggerID:  evt.VloggerID,
-		}); err != nil {
-			return err
-		}
-		if w.creators != nil {
-			return w.creators.IncrementFans(ctx, evt.VloggerID, -1)
-		}
-		return nil
-
+		err = w.applyUnfollow(ctx, &evt)
 	default:
 		// 未知动作类型，丢弃消息不处理，不重试
 		return nil
+	}
+	if err != nil && w.events != nil {
+		// 业务失败时删除幂等标记，保证重放时可以重新处理。
+		if unmarkErr := w.events.Unmark(ctx, "social", evt.EventID); unmarkErr != nil {
+			log.Printf("social worker: unmark failed event_id=%s: %v", evt.EventID, unmarkErr)
+		}
+	}
+	return err
+}
+
+// applyFollow 在事务内写入关注关系与粉丝数，并清理关注列表缓存。
+func (w *SocialWorker) applyFollow(ctx context.Context, evt *rabbitmq.SocialEvent) error {
+	relation := &domainsocial.Social{
+		FollowerID: evt.FollowerID,
+		VloggerID:  evt.VloggerID,
+	}
+	if err := w.repo.FollowWithStats(ctx, relation); err != nil {
+		// 重复关注是幂等场景，不重复增加粉丝数；仍清理一次缓存，修复可能丢失的失效消息。
+		if util.IsDuplicateEntry(err) || errors.Is(err, domainsocial.ErrAlreadyFollowed) {
+			w.invalidateFollowing(ctx, evt.FollowerID)
+			return nil
+		}
+		return err
+	}
+	w.invalidateFollowing(ctx, evt.FollowerID)
+
+	if w.notifier != nil {
+		_ = w.notifier.Publish(ctx, domainnotification.Event{
+			EventID:   evt.EventID,
+			AccountID: evt.VloggerID,
+			Type:      "follow",
+			Title:     "有新的粉丝",
+			Body:      "有人关注了你",
+			Data:      map[string]any{"follower_id": evt.FollowerID},
+		})
+	}
+	return nil
+}
+
+// applyUnfollow 在事务内删除关注关系与粉丝数，并清理粉丝 Inbox 中该博主的残留视频。
+func (w *SocialWorker) applyUnfollow(ctx context.Context, evt *rabbitmq.SocialEvent) error {
+	relation := &domainsocial.Social{
+		FollowerID: evt.FollowerID,
+		VloggerID:  evt.VloggerID,
+	}
+	if err := w.repo.UnfollowWithStats(ctx, relation); err != nil {
+		// 关系不存在说明已经取关或事件乱序，直接视为成功，避免重复扣减粉丝数。
+		if errors.Is(err, domainsocial.ErrNotFollowed) {
+			w.invalidateFollowing(ctx, evt.FollowerID)
+			return nil
+		}
+		return err
+	}
+	w.invalidateFollowing(ctx, evt.FollowerID)
+	w.cleanInbox(ctx, evt.FollowerID, evt.VloggerID)
+	return nil
+}
+
+// invalidateFollowing 清理关注列表缓存，失败由 TTL 兜底。
+func (w *SocialWorker) invalidateFollowing(ctx context.Context, followerID uint) {
+	if w.followingCache == nil {
+		return
+	}
+	_ = w.followingCache.Invalidate(ctx, followerID) // 缓存失效失败不影响取关结果
+}
+
+// cleanInbox 删除粉丝 Inbox 中该作者最近的视频。
+// Outbox 只保留最近 100 条，更早的残留由读路径按关注集合过滤兜底。
+func (w *SocialWorker) cleanInbox(ctx context.Context, followerID, vloggerID uint) {
+	if w.timeline == nil {
+		return
+	}
+	entries, err := w.timeline.ReadOutbox(ctx, vloggerID, 0, 100)
+	if err != nil {
+		log.Printf("social worker: read outbox failed vlogger=%d: %v", vloggerID, err)
+		return
+	}
+	if len(entries) == 0 {
+		return
+	}
+	videoIDs := make([]uint, 0, len(entries))
+	for _, entry := range entries {
+		videoIDs = append(videoIDs, entry.VideoID)
+	}
+	if err := w.timeline.RemoveFromInbox(ctx, followerID, videoIDs); err != nil {
+		log.Printf("social worker: clean inbox failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
 	}
 }

@@ -63,6 +63,8 @@ func SetRouter(deps Dependencies) *gin.Engine {
 	likeIdempotency := idempotency.Require(cache, "video:like", 24*time.Hour)
 	unlikeIdempotency := idempotency.Require(cache, "video:unlike", 24*time.Hour)
 	commentIdempotency := idempotency.Require(cache, "video:comment", 24*time.Hour)
+	followIdempotency := idempotency.Require(cache, "social:follow", 24*time.Hour)
+	unfollowIdempotency := idempotency.Require(cache, "social:unfollow", 24*time.Hour)
 
 	// account
 	accountGroup := r.Group("/account")
@@ -107,8 +109,8 @@ func SetRouter(deps Dependencies) *gin.Engine {
 	// social
 	socialGroup := r.Group("/social")
 	{
-		socialGroup.POST("/follow", jwt.JWTAuth(tokens), socialLimit, deps.SocialHandler.Follow)
-		socialGroup.POST("/unfollow", jwt.JWTAuth(tokens), socialLimit, deps.SocialHandler.Unfollow)
+		socialGroup.POST("/follow", jwt.JWTAuth(tokens), socialLimit, followIdempotency, deps.SocialHandler.Follow)
+		socialGroup.POST("/unfollow", jwt.JWTAuth(tokens), socialLimit, unfollowIdempotency, deps.SocialHandler.Unfollow)
 		socialGroup.POST("/getAllFollowers", jwt.SoftJWTAuth(tokens), deps.SocialHandler.GetAllFollowers)
 		socialGroup.POST("/getAllVloggers", jwt.SoftJWTAuth(tokens), deps.SocialHandler.GetAllVloggers)
 	}

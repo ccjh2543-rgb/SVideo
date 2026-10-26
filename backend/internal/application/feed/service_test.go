@@ -5,6 +5,7 @@ import (
 	"time"
 
 	domainfeed "feedsystem_video_go/internal/domain/feed"
+	domainvideo "feedsystem_video_go/internal/domain/video"
 )
 
 func TestLinearDecayWeights(t *testing.T) {
@@ -61,5 +62,76 @@ func TestMergeTimelineEntries(t *testing.T) {
 	}
 	if merged[2].VideoID != 1 || merged[2].Score != 200 {
 		t.Fatalf("unexpected third entry: %+v", merged[2])
+	}
+}
+
+func TestFilterTimelineEntries(t *testing.T) {
+	entries := []domainfeed.TimelineEntry{
+		{VideoID: 60, Score: 1000},
+		{VideoID: 50, Score: 1000},
+		{VideoID: 40, Score: 1000},
+		{VideoID: 99, Score: 999},
+		{VideoID: 30, Score: 998},
+	}
+
+	tests := []struct {
+		name     string
+		cursorMs int64
+		cursorID uint
+		wantIDs  []uint
+	}{
+		{
+			name:     "第一页不过滤",
+			cursorMs: 0,
+			cursorID: 0,
+			wantIDs:  []uint{60, 50, 40, 99, 30},
+		},
+		{
+			name:     "双游标过滤同毫秒",
+			cursorMs: 1000,
+			cursorID: 50,
+			wantIDs:  []uint{40, 99, 30},
+		},
+		{
+			name:     "只有时间游标时丢弃同毫秒",
+			cursorMs: 1000,
+			cursorID: 0,
+			wantIDs:  []uint{99, 30},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterTimelineEntries(entries, tt.cursorMs, tt.cursorID)
+			if len(got) != len(tt.wantIDs) {
+				t.Fatalf("expected %d entries, got %d: %+v", len(tt.wantIDs), len(got), got)
+			}
+			for i, wantID := range tt.wantIDs {
+				if got[i].VideoID != wantID {
+					t.Fatalf("index %d: expected video %d, got %d", i, wantID, got[i].VideoID)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterVideosByAuthors(t *testing.T) {
+	videos := []*domainvideo.Video{
+		{ID: 1, AuthorID: 10},
+		{ID: 2, AuthorID: 20},
+		{ID: 3, AuthorID: 30},
+		nil,
+	}
+	allowed := map[uint]struct{}{
+		10: {},
+		30: {},
+	}
+
+	got := filterVideosByAuthors(videos, allowed)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 videos, got %d", len(got))
+	}
+	if got[0].ID != 1 || got[1].ID != 3 {
+		t.Fatalf("unexpected videos: %+v", got)
 	}
 }

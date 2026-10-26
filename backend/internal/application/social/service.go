@@ -19,16 +19,33 @@ type EventPublisher interface {
 	UnFollow(ctx context.Context, followerID, vloggerID uint) error
 }
 
+// FollowingCacheInvalidator 关注列表缓存失效端口。
+// 关注关系变化后需要立即清理缓存，避免关注流读到旧数据。
+type FollowingCacheInvalidator interface {
+	Invalidate(ctx context.Context, followerID uint) error
+}
+
 // SocialService 社交应用服务。
 type SocialService struct {
-	repo     domainsocial.Repository
-	accounts AccountExister
-	events   EventPublisher
+	repo           domainsocial.Repository
+	accounts       AccountExister
+	events         EventPublisher
+	followingCache FollowingCacheInvalidator
 }
 
 // NewSocialService 创建社交应用服务。
-func NewSocialService(repo domainsocial.Repository, accounts AccountExister, events EventPublisher) *SocialService {
-	return &SocialService{repo: repo, accounts: accounts, events: events}
+func NewSocialService(
+	repo domainsocial.Repository,
+	accounts AccountExister,
+	events EventPublisher,
+	followingCache FollowingCacheInvalidator,
+) *SocialService {
+	return &SocialService{
+		repo:           repo,
+		accounts:       accounts,
+		events:         events,
+		followingCache: followingCache,
+	}
 }
 
 // ensureAccountsExist 校验关注双方账号都存在。
@@ -69,10 +86,15 @@ func (s *SocialService) Follow(ctx context.Context, relation *domainsocial.Socia
 
 	if s.events != nil {
 		if err := s.events.Follow(ctx, relation.FollowerID, relation.VloggerID); err == nil {
+			s.invalidateFollowing(ctx, relation.FollowerID)
 			return nil
 		}
 	}
-	return s.repo.Follow(ctx, relation)
+	if err := s.repo.FollowWithStats(ctx, relation); err != nil {
+		return err
+	}
+	s.invalidateFollowing(ctx, relation.FollowerID)
+	return nil
 }
 
 // Unfollow 取消关注。
@@ -94,10 +116,24 @@ func (s *SocialService) Unfollow(ctx context.Context, relation *domainsocial.Soc
 
 	if s.events != nil {
 		if err := s.events.UnFollow(ctx, relation.FollowerID, relation.VloggerID); err == nil {
+			s.invalidateFollowing(ctx, relation.FollowerID)
 			return nil
 		}
 	}
-	return s.repo.Unfollow(ctx, relation)
+	if err := s.repo.UnfollowWithStats(ctx, relation); err != nil {
+		return err
+	}
+	s.invalidateFollowing(ctx, relation.FollowerID)
+	return nil
+}
+
+// invalidateFollowing 清理关注列表缓存。
+// 缓存失效失败不影响关注结果，缓存 TTL 会兜底。
+func (s *SocialService) invalidateFollowing(ctx context.Context, followerID uint) {
+	if s.followingCache == nil {
+		return
+	}
+	_ = s.followingCache.Invalidate(ctx, followerID) // 失败由 TTL 兜底，不影响主流程
 }
 
 // GetFollowers 查询博主粉丝列表。

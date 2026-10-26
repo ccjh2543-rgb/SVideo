@@ -56,8 +56,8 @@ func (r *Repository) ListLikesCountWithCursor(ctx context.Context, limit int, cu
 
 // ListByFollowing 查询关注作者发布的视频。
 // 使用子查询先取关注列表，再查视频，避免大表 JOIN 放大。
-func (r *Repository) ListByFollowing(ctx context.Context, limit int, viewerID uint, before time.Time) ([]*domainvideo.Video, error) {
-	query := r.db.WithContext(ctx).Model(&videomysql.VideoModel{}).Order("create_time DESC")
+func (r *Repository) ListByFollowing(ctx context.Context, limit int, viewerID uint, before time.Time, beforeID uint) ([]*domainvideo.Video, error) {
+	query := r.db.WithContext(ctx).Model(&videomysql.VideoModel{}).Order("create_time DESC, id DESC")
 
 	if viewerID > 0 {
 		followingSubQuery := r.db.WithContext(ctx).
@@ -68,7 +68,11 @@ func (r *Repository) ListByFollowing(ctx context.Context, limit int, viewerID ui
 	}
 
 	if !before.IsZero() {
-		query = query.Where("create_time < ?", before)
+		if beforeID > 0 {
+			query = query.Where("create_time < ? OR (create_time = ? AND id < ?)", before, before, beforeID)
+		} else {
+			query = query.Where("create_time < ?", before)
+		}
 	}
 	return r.find(query, limit)
 }

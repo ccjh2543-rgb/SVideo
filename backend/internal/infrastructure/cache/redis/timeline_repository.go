@@ -116,11 +116,13 @@ func outboxKey(authorID uint) string {
 }
 
 // scoreCursor 把游标转换为 Redis 分数上界。
+// 上界包含游标本身：同一毫秒可能有多条视频，交给应用层按 (score, videoID) 精确过滤，
+// 避免像 score-1 那样把同毫秒的其他视频整段跳过。
 func scoreCursor(maxScore int64) string {
 	if maxScore <= 0 {
 		return "+inf"
 	}
-	return strconv.FormatInt(maxScore-1, 10)
+	return strconv.FormatInt(maxScore, 10)
 }
 
 // toEntries 把 Redis 结果转换为领域时间线记录。

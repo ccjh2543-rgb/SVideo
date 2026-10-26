@@ -39,3 +39,14 @@ func (r *ProcessedEventRepository) TryMark(ctx context.Context, consumer string,
 	}
 	return result.RowsAffected > 0, nil
 }
+
+// Unmark 删除幂等标记。
+// 与 TryMark 配套使用：业务处理失败后调用，确保消息重放时不会因为残留标记被跳过。
+func (r *ProcessedEventRepository) Unmark(ctx context.Context, consumer string, eventID string) error {
+	if r == nil || r.db == nil || consumer == "" || eventID == "" {
+		return nil
+	}
+	return r.db.WithContext(ctx).
+		Where("consumer = ? AND event_id = ?", consumer, eventID).
+		Delete(&ProcessedEventModel{}).Error
+}

@@ -50,6 +50,7 @@ const following = reactive({
   error: '',
   hasMore: false,
   nextTime: 0,
+  nextId: 0,
 })
 
 const likeBusy = reactive<Record<string, boolean>>({})
@@ -202,9 +203,14 @@ async function loadFollowing(reset: boolean) {
   following.loading = true
   following.error = ''
   try {
-    const res = await feedApi.listByFollowing({ limit: 10, latest_time: reset ? 0 : following.nextTime })
+    const res = await feedApi.listByFollowing({
+      limit: 10,
+      latest_time: reset ? 0 : following.nextTime,
+      latest_id: reset ? undefined : following.nextId,
+    })
     following.hasMore = res.has_more
     following.nextTime = res.next_time
+    following.nextId = res.next_id ?? 0
     following.items = reset ? res.video_list : following.items.concat(res.video_list)
   } catch (e) {
     following.error = e instanceof ApiError ? e.message : String(e)

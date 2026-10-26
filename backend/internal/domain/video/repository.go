@@ -67,4 +67,6 @@ type OutboxRepository interface {
 	ListPending(ctx context.Context, now time.Time, limit int) ([]OutboxMessage, error)
 	Delete(ctx context.Context, id uint) error
 	MarkRetry(ctx context.Context, id uint, retryCount int, status string, nextRetry *time.Time) error
+	// RequeueFailed 把失败消息重新置为待投递，用于补偿任务。
+	RequeueFailed(ctx context.Context, olderThan time.Time, limit int) (int64, error)
 }

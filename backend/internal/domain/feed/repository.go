@@ -24,7 +24,8 @@ type FeedRepository interface {
 	ListLikesCountWithCursor(ctx context.Context, limit int, cursor *LikesCountCursor) ([]*domainvideo.Video, error)
 
 	// ListByFollowing 查询关注作者发布的视频，用于推拉结合不可用时的降级路径。
-	ListByFollowing(ctx context.Context, limit int, viewerID uint, before time.Time) ([]*domainvideo.Video, error)
+	// 使用 (create_time, id) 双游标，避免同一毫秒的多条视频在翻页时被跳过。
+	ListByFollowing(ctx context.Context, limit int, viewerID uint, before time.Time, beforeID uint) ([]*domainvideo.Video, error)
 
 	// ListByPopularity 按热度倒序查询，热度相同再按时间、ID 兜底。
 	ListByPopularity(ctx context.Context, limit int, popularityBefore int64, before time.Time, beforeID uint) ([]*domainvideo.Video, error)

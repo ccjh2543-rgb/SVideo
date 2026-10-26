@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	feedapp "feedsystem_video_go/internal/application/feed"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
+	domainfeed "feedsystem_video_go/internal/domain/feed"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	feedcache "feedsystem_video_go/internal/infrastructure/cache/redis/feed"
 	"feedsystem_video_go/internal/infrastructure/messaging/rabbitmq"
 	accountmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql"
 	socialmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/social"
@@ -168,16 +171,28 @@ func main() {
 	creatorRepo := socialmysql.NewStatsRepository(sqlDB)
 	processedEvents := accountmysql.NewProcessedEventRepository(sqlDB)
 	notifier := ws.NewRedisNotifier(cache, nil)
+	followingCache := feedcache.NewFollowingCache(cache)
+
+	var socialTimeline domainfeed.TimelineRepository
+	if cache != nil {
+		socialTimeline = rediscache.NewTimelineRepository(cache)
+	}
 
 	var fanoutService *feedapp.FanoutService
-	if cache != nil {
+	if socialTimeline != nil {
 		fanoutService = feedapp.NewFanoutService(
 			creatorRepo,
 			repo,
-			rediscache.NewTimelineRepository(cache),
+			socialTimeline,
 			0,
 			500,
 		)
+	}
+
+	// 热榜快照由后台任务预生成，请求路径只读快照。
+	var hotSnapshotBuilder *feedworkers.HotSnapshotBuilder
+	if cache != nil {
+		hotSnapshotBuilder = feedworkers.NewHotSnapshotBuilder(feedcache.NewRankingCache(cache))
 	}
 
 	// ============================================================
@@ -189,11 +204,12 @@ func main() {
 	var commentWorker *videoworkers.CommentWorker
 	var popularityWorker *videoworkers.PopularityWorker
 	var fanoutWorker *feedworkers.FanoutWorker
+	var dlqReplayers []*feedworkers.DLQReplayer
 
 	// 只有当 RabbitMQ 通道（ch）不为 nil 时，才创建工作线程
 	// 队列名称（如 socialQueue）应当是在其他地方定义的常量，代表需要监听的队列名
 	if ch != nil {
-		socialWorker = socialworkers.NewSocialWorker(ch, repo, creatorRepo, processedEvents, notifier, socialQueue)
+		socialWorker = socialworkers.NewSocialWorker(ch, repo, socialTimeline, followingCache, processedEvents, notifier, socialQueue)
 		likeWorker = videoworkers.NewLikeWorker(ch, likeRepo, videoRepo, processedEvents, notifier, likeQueue)
 		commentWorker = videoworkers.NewCommentWorker(ch, commentRepo, videoRepo, processedEvents, notifier, commentQueue)
 
@@ -211,6 +227,17 @@ func main() {
 				fanoutWorker = feedworkers.NewFanoutWorker(ch, fanoutService, processedEvents, rabbitmq.FanoutQueueName)
 			}
 		}
+
+		// 死信重放：时间线 DLQ 与写扩散 DLQ 各启动一个消费者。
+		baseRMQ := &rabbitmq.RabbitMQ{Conn: conn, Ch: ch}
+		if timelineMQ, err := rabbitmq.NewTimelineMQ(baseRMQ); err != nil {
+			log.Printf("Failed to declare timeline topology for DLQ replayer: %v", err)
+		} else {
+			dlqReplayers = append(dlqReplayers, feedworkers.NewDLQReplayer(ch, timelineMQ, rabbitmq.TimelineDLQName))
+			if fanoutWorker != nil {
+				dlqReplayers = append(dlqReplayers, feedworkers.NewDLQReplayer(ch, timelineMQ, rabbitmq.FanoutDLQName))
+			}
+		}
 	}
 
 	// ============================================================
@@ -218,7 +245,26 @@ func main() {
 	// ============================================================
 	// 创建一个可被系统信号（SIGINT, SIGTERM）取消的 context
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop() // 确保在函数退出时取消信号监听
+	defer stop() // 确保程序退出时取消信号监听
+
+	// 死信重放任务：与主业务 Worker 独立运行，失败不影响进程主流程。
+	for i := range dlqReplayers {
+		replayer := dlqReplayers[i]
+		go func() {
+			if err := replayer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("DLQ replayer stopped: %v", err)
+			}
+		}()
+	}
+
+	// 热榜快照预生成任务。
+	if hotSnapshotBuilder != nil {
+		go func() {
+			if err := hotSnapshotBuilder.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("Hot snapshot builder stopped: %v", err)
+			}
+		}()
+	}
 
 	// 启动 pprof 性能分析 HTTP 服务（用于调试）
 	pprofServer, err := observability.NewPprofServer(

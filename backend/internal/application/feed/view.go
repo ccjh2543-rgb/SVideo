@@ -36,7 +36,8 @@ type LikesCountResult struct {
 // FollowingResult 关注流结果。
 type FollowingResult struct {
 	VideoList []FeedItem
-	NextTime  int64
+	NextTime  int64 // 毫秒时间戳
+	NextID    *uint // 与 NextTime 组成双游标，保证同一毫秒翻页不重不漏
 	HasMore   bool
 }
 

@@ -91,26 +91,26 @@ func (w *CommentWorker) process(ctx context.Context, body []byte) error {
 			return nil
 		}
 	}
+	var err error
 	switch evt.Action {
 	case "publish":
-		return w.applyPublish(ctx, &evt)
+		err = w.applyPublish(ctx, &evt)
 	case "delete":
-		return w.applyDelete(ctx, &evt)
+		err = w.applyDelete(ctx, &evt)
 	default:
 		return nil
 	}
+	if err != nil && w.events != nil {
+		// 业务失败时删除幂等标记，保证消息重放可以重新处理。
+		if unmarkErr := w.events.Unmark(ctx, "comment", evt.EventID); unmarkErr != nil {
+			log.Printf("comment worker: unmark failed event_id=%s: %v", evt.EventID, unmarkErr)
+		}
+	}
+	return err
 }
 
 func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentEvent) error {
 	if evt == nil || evt.VideoID == 0 || evt.AuthorID == 0 || strings.TrimSpace(evt.Content) == "" {
-		return nil
-	}
-
-	ok, err := w.videos.IsExist(ctx, evt.VideoID)
-	if err != nil {
-		return err
-	}
-	if !ok {
 		return nil
 	}
 
@@ -120,10 +120,11 @@ func (w *CommentWorker) applyPublish(ctx context.Context, evt *rabbitmq.CommentE
 		AuthorID: evt.AuthorID,
 		Content:  strings.TrimSpace(evt.Content),
 	}
-	if err := w.comments.Create(ctx, c); err != nil {
-		return err
-	}
-	if err := w.videos.ChangePopularity(ctx, evt.VideoID, 1); err != nil {
+	// 评论写入与热度更新放在同一事务，避免“评论成功但热度没加”。
+	if err := w.comments.CreateWithPopularity(ctx, c); err != nil {
+		if errors.Is(err, domainvideo.ErrVideoNotFound) {
+			return nil
+		}
 		return err
 	}
 

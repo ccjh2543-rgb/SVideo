@@ -83,11 +83,32 @@ func (c *RankingCache) LatestIDs(ctx context.Context, maxScore int64, limit int)
 
 // EnsureSnapshot 确保热榜合并快照存在。
 // 快照不存在时按小时桶和权重合并，并设置固定 TTL，保证同一 as_of 下翻页稳定。
+// 使用分布式锁保证同一时刻只有一个实例执行 ZUNIONSTORE，避免并发阻塞 Redis。
 func (c *RankingCache) EnsureSnapshot(ctx context.Context, dest string, keys []string, weights []float64) error {
 	if c == nil || c.cache == nil || dest == "" || len(keys) == 0 {
 		return nil
 	}
 	exists, err := c.cache.Exists(ctx, dest)
+	if err != nil || exists {
+		return err
+	}
+
+	lockKey := "lock:" + dest
+	token, ok, err := c.cache.Lock(ctx, lockKey, 30*time.Second)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// 其他实例正在构建，直接返回；调用方读不到会走降级路径。
+		return nil
+	}
+	defer func() {
+		// 解锁失败只会让锁在 TTL 后自动释放，不影响数据正确性。
+		_ = c.cache.Unlock(context.Background(), lockKey, token)
+	}()
+
+	// 双重检查：等锁期间可能已被其他实例构建完成。
+	exists, err = c.cache.Exists(ctx, dest)
 	if err != nil || exists {
 		return err
 	}

@@ -1,6 +1,8 @@
 package feed
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -136,11 +138,25 @@ func (h *FeedHandler) ListByFollowing(c *gin.Context) {
 
 	var latestTime time.Time
 	if req.LatestTime > 0 {
-		latestTime = time.Unix(req.LatestTime, 0)
+		// 关注流游标统一使用毫秒时间戳，与 Redis ZSet 的 score 精度一致。
+		latestTime = time.UnixMilli(req.LatestTime)
+	}
+	var latestID uint
+	if req.LatestID != nil {
+		latestID = *req.LatestID
 	}
 
-	result, err := h.service.ListByFollowing(c.Request.Context(), req.Limit, latestTime, viewerAccountID)
+	// 关注流总预算：Redis 阶段 120ms + 数据库降级 300ms，留出余量。
+	reqCtx, cancel := context.WithTimeout(c.Request.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	result, err := h.service.ListByFollowing(reqCtx, req.Limit, latestTime, latestID, viewerAccountID)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "feed temporarily unavailable"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -148,6 +164,7 @@ func (h *FeedHandler) ListByFollowing(c *gin.Context) {
 	c.JSON(http.StatusOK, ListByFollowingResponse{
 		VideoList: toFeedVideoItems(result.VideoList),
 		NextTime:  result.NextTime,
+		NextID:    result.NextID,
 		HasMore:   result.HasMore,
 	})
 }
@@ -161,6 +178,19 @@ func (h *FeedHandler) ListByPopularity(c *gin.Context) {
 	}
 	if req.Limit <= 0 || req.Limit > 50 {
 		req.Limit = 10
+	}
+	// as_of 白名单：必须是整点、不能是未来、最多回看 7 天，避免任意 key 击穿缓存。
+	if req.AsOf > 0 {
+		if req.AsOf%3600 != 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "as_of must be an hour boundary"})
+			return
+		}
+		asOf := time.Unix(req.AsOf, 0).UTC()
+		now := time.Now().UTC()
+		if asOf.After(now.Add(time.Hour)) || asOf.Before(now.Add(-7*24*time.Hour)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "as_of out of range"})
+			return
+		}
 	}
 
 	viewerAccountID, err := jwt.GetAccountID(c)

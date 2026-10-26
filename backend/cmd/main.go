@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -23,6 +24,7 @@ import (
 	feedmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/feed"
 	socialmysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/social"
 	videomysql "feedsystem_video_go/internal/infrastructure/persistence/mysql/video"
+	"feedsystem_video_go/internal/infrastructure/resilience"
 	"feedsystem_video_go/internal/infrastructure/security"
 	feedworkers "feedsystem_video_go/internal/infrastructure/workers/feed"
 	httpaccount "feedsystem_video_go/internal/interfaces/http/account"
@@ -187,26 +189,39 @@ func main() {
 	}
 	socialRepository := socialmysql.NewRepository(sqlDB)
 	creatorStatsRepository := socialmysql.NewStatsRepository(sqlDB)
+	followingCache := feedcache.NewFollowingCache(cache)
 	var socialPublisher appsocial.EventPublisher
 	if socialMQ != nil {
 		socialPublisher = socialMQ
 	}
-	socialService := appsocial.NewSocialService(socialRepository, accountRepository, socialPublisher)
+	socialService := appsocial.NewSocialService(socialRepository, accountRepository, socialPublisher, followingCache)
 	socialHandler := httpsocial.NewSocialHandler(socialService)
 
 	// ============================================================
 	// 组合根：Feed
 	// ============================================================
+	// 按依赖拆分熔断器，避免一个组件故障把全部能力一起关闭。
+	guard := resilience.NewGuard("redis-feed", "redis-detail", "redis-popularity", "mq-publish", "mysql-feed")
 	feedRepository := feedmysql.NewRepository(sqlDB)
 	feedService := appfeed.NewFeedService(
 		feedRepository,
 		likeRepository,
-		feedcache.NewDetailCache(cache),
+		feedcache.NewDetailCache(cache, guard),
 		feedcache.NewRankingCache(cache),
 		rediscache.NewTimelineRepository(cache),
 		creatorStatsRepository,
+		followingCache,
+		guard,
 	)
 	feedHandler := httpfeed.NewFeedHandler(feedService)
+
+	// Outbox 补偿任务：把三次投递失败后标记为 failed 的消息重新置为 pending。
+	compensator := feedworkers.NewOutboxCompensator(videomysql.NewOutboxRepository(sqlDB))
+	go func() {
+		if err := compensator.Run(context.Background()); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("Outbox compensator stopped: %v", err)
+		}
+	}()
 
 	// ============================================================
 	// 组合根：时间线消费者

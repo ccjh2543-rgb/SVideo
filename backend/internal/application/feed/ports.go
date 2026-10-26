@@ -3,6 +3,7 @@ package feed
 import (
 	"context"
 
+	domainsocial "feedsystem_video_go/internal/domain/social"
 	domainvideo "feedsystem_video_go/internal/domain/video"
 )
 
@@ -33,4 +34,22 @@ type RankingCache interface {
 	EnsureSnapshot(ctx context.Context, dest string, keys []string, weights []float64) error
 	// SnapshotIDs 按热度倒序从快照中取 [offset, offset+limit) 的视频 ID。
 	SnapshotIDs(ctx context.Context, dest string, offset int, limit int) ([]uint, error)
+}
+
+// FollowingCache 关注列表缓存端口。
+// 读关注流时避免每页都执行 socials JOIN creator_stats。
+type FollowingCache interface {
+	// Get 读取关注列表，ok=false 表示未命中。
+	Get(ctx context.Context, followerID uint) ([]*domainsocial.Stats, bool)
+	// Set 写入关注列表缓存。
+	Set(ctx context.Context, followerID uint, stats []*domainsocial.Stats)
+}
+
+// DependencyGuard 依赖熔断端口。
+// 应用层只表达“该依赖当前是否允许调用”，具体熔断算法位于 infrastructure/resilience。
+type DependencyGuard interface {
+	// Allow 判断指定依赖是否放行。
+	Allow(name string) bool
+	// Record 记录依赖调用结果，err 非空表示依赖失败。
+	Record(name string, err error)
 }

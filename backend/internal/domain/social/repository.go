@@ -13,8 +13,14 @@ const BigVFansThreshold int64 = 100000
 type Repository interface {
 	// Follow 创建关注关系。
 	Follow(ctx context.Context, relation *Social) error
+	// FollowWithStats 在同一事务内创建关注关系并增加粉丝数。
+	// 用于 MQ 不可用时的同步兜底，避免“关系写入成功但粉丝数没更新”。
+	FollowWithStats(ctx context.Context, relation *Social) error
 	// Unfollow 删除关注关系。
 	Unfollow(ctx context.Context, relation *Social) error
+	// UnfollowWithStats 在同一事务内删除关注关系并减少粉丝数。
+	// 关系不存在时返回 ErrNotFollowed，调用方不应再减少粉丝数。
+	UnfollowWithStats(ctx context.Context, relation *Social) error
 	// IsFollowed 判断关注关系是否存在。
 	IsFollowed(ctx context.Context, relation *Social) (bool, error)
 	// GetFollowers 查询博主的粉丝列表。

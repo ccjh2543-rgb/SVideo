@@ -4,6 +4,7 @@ import (
 	"context"
 
 	domainsocial "feedsystem_video_go/internal/domain/social"
+	"feedsystem_video_go/internal/util"
 
 	"gorm.io/gorm"
 )
@@ -31,6 +32,39 @@ func (r *Repository) Unfollow(ctx context.Context, relation *domainsocial.Social
 	return r.db.WithContext(ctx).
 		Where("follower_id = ? AND vlogger_id = ?", relation.FollowerID, relation.VloggerID).
 		Delete(&SocialModel{}).Error
+}
+
+// FollowWithStats 在同一事务内创建关注关系并增加粉丝数。
+// 并发或重复关注由 socials 的唯一索引兜底，重复时返回数据库错误，调用方按幂等处理。
+func (r *Repository) FollowWithStats(ctx context.Context, relation *domainsocial.Social) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&SocialModel{
+			FollowerID: relation.FollowerID,
+			VloggerID:  relation.VloggerID,
+		}).Error; err != nil {
+			if util.IsDuplicateEntry(err) {
+				return domainsocial.ErrAlreadyFollowed
+			}
+			return err
+		}
+		return upsertFans(tx, relation.VloggerID, 1)
+	})
+}
+
+// UnfollowWithStats 在同一事务内删除关注关系并减少粉丝数。
+// 关系不存在时返回 ErrNotFollowed，避免“没删到关系却仍然扣粉丝数”。
+func (r *Repository) UnfollowWithStats(ctx context.Context, relation *domainsocial.Social) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("follower_id = ? AND vlogger_id = ?", relation.FollowerID, relation.VloggerID).
+			Delete(&SocialModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return domainsocial.ErrNotFollowed
+		}
+		return upsertFans(tx, relation.VloggerID, -1)
+	})
 }
 
 // IsFollowed 判断关注关系是否存在。

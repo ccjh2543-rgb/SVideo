@@ -10,7 +10,6 @@ import (
 	"feedsystem_video_go/internal/infrastructure/workers"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
-	"time"
 )
 
 type LikeWorker struct {
@@ -96,42 +95,36 @@ func (w *LikeWorker) process(ctx context.Context, body []byte) error {
 		}
 	}
 
+	var err error
 	switch evt.Action {
 	case "like":
-		return w.applyLike(ctx, evt.UserID, evt.VideoID, evt.EventID)
+		err = w.applyLike(ctx, evt.UserID, evt.VideoID, evt.EventID)
 	case "unlike":
-		return w.applyUnlike(ctx, evt.UserID, evt.VideoID)
+		err = w.applyUnlike(ctx, evt.UserID, evt.VideoID)
 	default:
 		return nil
 	}
+	if err != nil && w.events != nil {
+		// 业务失败时删除幂等标记，保证消息重放时可以重新处理，避免计数永久少记。
+		if unmarkErr := w.events.Unmark(ctx, "like", evt.EventID); unmarkErr != nil {
+			log.Printf("like worker: unmark failed event_id=%s: %v", evt.EventID, unmarkErr)
+		}
+	}
+	return err
 }
 
+// applyLike 在同一事务内完成点赞关系、点赞数和热度的更新。
+// 重复点赞由 likes 表的唯一索引兜底，返回 ErrAlreadyLiked，视为成功。
 func (w *LikeWorker) applyLike(ctx context.Context, userID, videoID uint, eventID string) error {
-	ok, err := w.videos.IsExist(ctx, videoID)
+	created, err := w.likes.LikeWithCounters(ctx, videoID, userID)
 	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-
-	created, err := w.likes.LikeIgnoreDuplicate(ctx, &domainvideo.Like{
-		VideoID:   videoID,
-		AccountID: userID,
-		CreatedAt: time.Now(),
-	})
-	if err != nil {
+		if errors.Is(err, domainvideo.ErrAlreadyLiked) || errors.Is(err, domainvideo.ErrVideoNotFound) {
+			return nil
+		}
 		return err
 	}
 	if !created {
 		return nil
-	}
-
-	if err := w.videos.ChangeLikesCount(ctx, videoID, 1); err != nil {
-		return err
-	}
-	if err := w.videos.ChangePopularity(ctx, videoID, 1); err != nil {
-		return err
 	}
 
 	if w.notifier != nil {
@@ -150,25 +143,18 @@ func (w *LikeWorker) applyLike(ctx context.Context, userID, videoID uint, eventI
 	return nil
 }
 
+// applyUnlike 在同一事务内取消点赞并回退计数。
+// 未点过赞时返回 ErrNotLiked，视为成功，避免重复扣减。
 func (w *LikeWorker) applyUnlike(ctx context.Context, userID, videoID uint) error {
-	ok, err := w.videos.IsExist(ctx, videoID)
+	deleted, err := w.likes.UnlikeWithCounters(ctx, videoID, userID)
 	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
-
-	deleted, err := w.likes.DeleteByVideoAndAccount(ctx, videoID, userID)
-	if err != nil {
+		if errors.Is(err, domainvideo.ErrNotLiked) || errors.Is(err, domainvideo.ErrVideoNotFound) {
+			return nil
+		}
 		return err
 	}
 	if !deleted {
 		return nil
 	}
-
-	if err := w.videos.ChangeLikesCount(ctx, videoID, -1); err != nil {
-		return err
-	}
-	return w.videos.ChangePopularity(ctx, videoID, -1)
+	return nil
 }

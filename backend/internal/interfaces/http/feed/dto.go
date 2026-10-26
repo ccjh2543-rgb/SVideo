@@ -52,15 +52,18 @@ type ListLikesCountResponse struct {
 }
 
 // ListByFollowingRequest 关注流请求。
+// latest_time 为毫秒时间戳，与 latest_id 组成双游标。
 type ListByFollowingRequest struct {
 	Limit      int   `json:"limit"`
 	LatestTime int64 `json:"latest_time"`
+	LatestID   *uint `json:"latest_id,omitempty"`
 }
 
 // ListByFollowingResponse 关注流响应。
 type ListByFollowingResponse struct {
 	VideoList []FeedVideoItem `json:"video_list"`
 	NextTime  int64           `json:"next_time"`
+	NextID    *uint           `json:"next_id,omitempty"`
 	HasMore   bool            `json:"has_more"`
 }
 

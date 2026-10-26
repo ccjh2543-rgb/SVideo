@@ -10,6 +10,7 @@ import (
 	domainvideo "feedsystem_video_go/internal/domain/video"
 	cachelib "feedsystem_video_go/internal/infrastructure/cache"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
+	"feedsystem_video_go/internal/infrastructure/resilience"
 
 	gocache "github.com/patrickmn/go-cache"
 )
@@ -24,13 +25,15 @@ const (
 type DetailCache struct {
 	cache *rediscache.Client
 	local *gocache.Cache
+	guard *resilience.Guard
 }
 
 // NewDetailCache 创建视频实体缓存。
-func NewDetailCache(cache *rediscache.Client) *DetailCache {
+func NewDetailCache(cache *rediscache.Client, guard *resilience.Guard) *DetailCache {
 	return &DetailCache{
 		cache: cache,
 		local: gocache.New(localVideoTTL, localCleanup),
+		guard: guard,
 	}
 }
 
@@ -66,6 +69,10 @@ func (c *DetailCache) MGet(ctx context.Context, ids []uint) (map[uint]domainvide
 	if len(ids) == 0 {
 		return map[uint]domainvideo.Video{}, nil
 	}
+	// 熔断打开时直接返回错误，由应用层降级到 MySQL。
+	if c.guard != nil && !c.guard.Allow("redis-detail") {
+		return nil, fmt.Errorf("redis detail circuit open")
+	}
 
 	keys := make([]string, len(ids))
 	for i, id := range ids {
@@ -76,7 +83,13 @@ func (c *DetailCache) MGet(ctx context.Context, ids []uint) (map[uint]domainvide
 	defer cancel()
 	results, err := c.cache.MGet(cacheCtx, keys...)
 	if err != nil {
+		if c.guard != nil {
+			c.guard.Record("redis-detail", err)
+		}
 		return nil, err
+	}
+	if c.guard != nil {
+		c.guard.Record("redis-detail", nil)
 	}
 
 	hits := make(map[uint]domainvideo.Video, len(ids))

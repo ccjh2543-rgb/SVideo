@@ -18,6 +18,6 @@ export function listByPopularity(input: { limit: number; as_of: number; offset: 
   return postJson<ListByPopularityResponse>('/feed/listByPopularity', input)
 }
 
-export function listByFollowing(input: { limit: number; latest_time: number }) {
+export function listByFollowing(input: { limit: number; latest_time: number; latest_id?: number }) {
   return postJson<ListByFollowingResponse>('/feed/listByFollowing', input, { authRequired: true })
 }
