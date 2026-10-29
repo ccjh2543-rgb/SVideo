@@ -62,4 +62,10 @@ type StatsRepository interface {
 	IncrementFans(ctx context.Context, authorID uint, delta int64) error
 	// ListFollowing 查询当前用户关注的全部作者统计。
 	ListFollowing(ctx context.Context, followerID uint) ([]*Stats, error)
+	// ListDemotePending 查询“刚跌破大 V 退出阈值、等待批量降级回填”的作者。
+	// 返回结果按 author_id 升序，limit 为单轮最多处理的作者数。
+	ListDemotePending(ctx context.Context, limit int) ([]uint, error)
+	// MarkDemoteBackfilled 标记降级回填完成：清除 was_big 与待回填标记。
+	// 作者如果已经重新涨回大 V，则不会清除 was_big，避免读路径失去 Outbox 兜底。
+	MarkDemoteBackfilled(ctx context.Context, authorID uint) error
 }

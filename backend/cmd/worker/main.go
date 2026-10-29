@@ -212,6 +212,13 @@ func main() {
 		0,
 	)
 
+	// 大 V 掉粉跌破退出阈值后，把 Outbox 历史批量回填到粉丝 Inbox，
+	// 完成后清除 was_big，读路径不再为历史内容额外拉 Outbox。
+	var demoteBackfill *socialworkers.DemoteBackfillWorker
+	if socialTimeline != nil {
+		demoteBackfill = socialworkers.NewDemoteBackfillWorker(creatorRepo, repo, socialTimeline, 0)
+	}
+
 	// ============================================================
 	// 6. 创建具体的 Worker（消费者）
 	// ============================================================
@@ -289,6 +296,15 @@ func main() {
 			log.Printf("Counter reconciler stopped: %v", err)
 		}
 	}()
+
+	// 降级回填任务：大 V 变小 V 后补写粉丝 Inbox，失败由下一轮重试。
+	if demoteBackfill != nil {
+		go func() {
+			if err := demoteBackfill.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("Demote backfill worker stopped: %v", err)
+			}
+		}()
+	}
 
 	// 启动 pprof 性能分析 HTTP 服务（用于调试）
 	pprofServer, err := observability.NewPprofServer(

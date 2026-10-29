@@ -33,6 +33,14 @@ func (f *fakeCreatorRepository) ListFollowing(_ context.Context, _ uint) ([]*dom
 	return nil, nil
 }
 
+func (f *fakeCreatorRepository) ListDemotePending(_ context.Context, _ int) ([]uint, error) {
+	return nil, nil
+}
+
+func (f *fakeCreatorRepository) MarkDemoteBackfilled(_ context.Context, _ uint) error {
+	return nil
+}
+
 type fakeFollowerReader struct {
 	ids []uint
 }

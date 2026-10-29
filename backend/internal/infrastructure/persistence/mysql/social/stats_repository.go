@@ -63,8 +63,8 @@ func (r *StatsRepository) IncrementFans(ctx context.Context, authorID uint, delt
 // 供关注关系的事务化写入复用，保证 socials 与 creator_stats 同时生效。
 func upsertFans(tx *gorm.DB, authorID uint, delta int64) error {
 	if err := tx.Exec(
-		`INSERT INTO creator_stats (author_id, fans_count, is_big, was_big)
-		 VALUES (?, GREATEST(?, 0), ?, 0)
+		`INSERT INTO creator_stats (author_id, fans_count, is_big, was_big, demote_pending)
+		 VALUES (?, GREATEST(?, 0), ?, 0, 0)
 		 ON DUPLICATE KEY UPDATE fans_count = GREATEST(fans_count + ?, 0)`,
 		authorID, delta, delta >= domainsocial.BigVFansThreshold, delta,
 	).Error; err != nil {
@@ -72,11 +72,19 @@ func upsertFans(tx *gorm.DB, authorID uint, delta int64) error {
 	}
 	// 双阈值滞回：>= 10 万进入大 V，< 9 万才退出。
 	// was_big 记录“曾经是大 V 且已跌破退出阈值”，读路径据此继续拉 Outbox，避免历史断层。
+	// demote_pending 表示需要在这之后把 Outbox 历史批量回填到粉丝 Inbox，完成后清除 was_big。
+	// MySQL 单表 UPDATE 按从左到右求值，因此 was_big / demote_pending 读到的是修改前的 is_big，
+	// is_big 放在最后更新。
 	return tx.Exec(
 		`UPDATE creator_stats
 		 SET was_big = CASE
 		         WHEN is_big = 1 AND fans_count < ? THEN 1
 		         ELSE was_big
+		     END,
+		     demote_pending = CASE
+		         WHEN fans_count >= ? THEN 0
+		         WHEN is_big = 1 AND fans_count < ? THEN 1
+		         ELSE demote_pending
 		     END,
 		     is_big = CASE
 		         WHEN fans_count >= ? THEN 1
@@ -87,6 +95,41 @@ func upsertFans(tx *gorm.DB, authorID uint, delta int64) error {
 		domainsocial.BigVExitThreshold,
 		domainsocial.BigVFansThreshold,
 		domainsocial.BigVExitThreshold,
+		domainsocial.BigVFansThreshold,
+		domainsocial.BigVExitThreshold,
+		authorID,
+	).Error
+}
+
+// ListDemotePending 查询待执行降级回填的作者。
+// 只扫描“已经退出大 V 且还有待回填标记”的行，走 idx_stats_demote_pending 索引。
+func (r *StatsRepository) ListDemotePending(ctx context.Context, limit int) ([]uint, error) {
+	if limit <= 0 {
+		return []uint{}, nil
+	}
+	var ids []uint
+	if err := r.db.WithContext(ctx).
+		Model(&StatsModel{}).
+		Where("demote_pending = ? AND is_big = ?", true, false).
+		Order("author_id").
+		Limit(limit).
+		Pluck("author_id", &ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// MarkDemoteBackfilled 标记降级回填完成，并清除 was_big。
+// 粉丝 Inbox 已经拿到 Outbox 历史后，读路径不再需要为该作者额外拉 Outbox。
+// is_big = 0 作为并发保护：作者重新涨回大 V 时保留 was_big。
+func (r *StatsRepository) MarkDemoteBackfilled(ctx context.Context, authorID uint) error {
+	if authorID == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Exec(
+		`UPDATE creator_stats
+		 SET was_big = 0, demote_pending = 0
+		 WHERE author_id = ? AND is_big = 0`,
 		authorID,
 	).Error
 }

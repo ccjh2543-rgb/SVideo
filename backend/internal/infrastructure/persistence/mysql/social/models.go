@@ -15,10 +15,12 @@ func (SocialModel) TableName() string { return "socials" }
 
 // StatsModel 创作者统计表 GORM 模型。
 type StatsModel struct {
-	AuthorID        uint       `gorm:"primaryKey;autoIncrement:false"`
-	FansCount       int64      `gorm:"not null;default:0"`
-	IsBig           bool       `gorm:"not null;default:false"`
-	WasBig          bool       `gorm:"not null;default:false"`
+	AuthorID  uint  `gorm:"primaryKey;autoIncrement:false"`
+	FansCount int64 `gorm:"not null;default:0"`
+	IsBig     bool  `gorm:"not null;default:false"`
+	WasBig    bool  `gorm:"not null;default:false"`
+	// DemotePending 表示作者刚从大 V 跌破退出阈值，等待批量降级回填粉丝 Inbox。
+	DemotePending   bool       `gorm:"not null;default:false;index:idx_stats_demote_pending"`
 	LastPublishTime *time.Time `gorm:"index"`
 }
 

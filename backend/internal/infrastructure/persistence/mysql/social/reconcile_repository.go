@@ -51,11 +51,28 @@ func (r *ReconcileRepository) FindFansCountDrifts(ctx context.Context, limit int
 }
 
 // FixFansCount 把粉丝数修正为明细行数，并同步刷新 is_big。
+// 对账同样可能触发“大 V → 小 V”，因此需要写入 demote_pending，
+// 让后台任务把 Outbox 历史批量回填到粉丝 Inbox。
 func (r *ReconcileRepository) FixFansCount(ctx context.Context, authorID uint, expected int64) error {
 	return r.db.WithContext(ctx).Exec(
 		`UPDATE creator_stats
-		 SET fans_count = ?, is_big = (? >= ?)
+		 SET was_big = CASE
+		         WHEN is_big = 1 AND ? < ? THEN 1
+		         ELSE was_big
+		     END,
+		     demote_pending = CASE
+		         WHEN ? >= ? THEN 0
+		         WHEN is_big = 1 AND ? < ? THEN 1
+		         ELSE demote_pending
+		     END,
+		     fans_count = ?,
+		     is_big = (? >= ?)
 		 WHERE author_id = ?`,
-		expected, expected, domainsocial.BigVFansThreshold, authorID,
+		expected, domainsocial.BigVExitThreshold,
+		expected, domainsocial.BigVFansThreshold,
+		expected, domainsocial.BigVExitThreshold,
+		expected,
+		expected, domainsocial.BigVFansThreshold,
+		authorID,
 	).Error
 }
