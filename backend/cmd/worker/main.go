@@ -185,6 +185,7 @@ func main() {
 	}
 
 	var fanoutService *feedapp.FanoutService
+	var heavyPushService *feedapp.HeavyPushService
 	if socialTimeline != nil {
 		fanoutService = feedapp.NewFanoutService(
 			creatorRepo,
@@ -194,7 +195,11 @@ func main() {
 			500,
 		)
 		// 大 V 发布时只向重度粉丝选择性推，避免全量粉丝写扩散。
-		fanoutService.SetHeavyPush(feedapp.NewHeavyPushService(heavyRegistry, socialTimeline, 500))
+		// 正常走独立队列异步执行；队列不可用时退回同步推送。
+		heavyPushService = feedapp.NewHeavyPushService(heavyRegistry, socialTimeline, 500)
+		fanoutService.SetHeavyPush(heavyPushService)
+		// 写扩散断点续传：失败重投时从上次粉丝游标继续。
+		fanoutService.SetFanoutProgress(feedcache.NewFanoutProgressStore(cache))
 	}
 
 	// 热榜快照由后台任务预生成，请求路径只读快照。
@@ -228,6 +233,10 @@ func main() {
 	var commentWorker *videoworkers.CommentWorker
 	var popularityWorker *videoworkers.PopularityWorker
 	var fanoutWorker *feedworkers.FanoutWorker
+	var heavyPushWorker *feedworkers.HeavyPushWorker
+	var largeFanoutWorker *feedworkers.LargeFanoutWorker
+	var heavyPushMQ *rabbitmq.HeavyPushMQ
+	var largeFanoutMQ *rabbitmq.LargeFanoutMQ
 	var dlqReplayers []*feedworkers.DLQReplayer
 
 	// 只有当 RabbitMQ 通道（ch）不为 nil 时，才创建工作线程
@@ -250,9 +259,27 @@ func main() {
 			} else {
 				fanoutWorker = feedworkers.NewFanoutWorker(ch, fanoutService, processedEvents, rabbitmq.FanoutQueueName)
 			}
+
+			// 重度粉丝推送独立队列：大 V 发布只投递任务，不再阻塞写扩散。
+			if heavyMQ, err := rabbitmq.NewHeavyPushMQ(baseRMQ); err != nil {
+				log.Printf("Failed to declare heavy push topology: %v", err)
+			} else if heavyPushService != nil {
+				heavyPushMQ = heavyMQ
+				fanoutService.SetHeavyPushPublisher(heavyMQ)
+				heavyPushWorker = feedworkers.NewHeavyPushWorker(ch, heavyPushService, processedEvents, rabbitmq.HeavyPushQueueName)
+			}
+
+			// 大粉丝量作者独立队列：一次大扩散不占用普通写扩散的并发。
+			if largeMQ, err := rabbitmq.NewLargeFanoutMQ(baseRMQ); err != nil {
+				log.Printf("Failed to declare large fanout topology: %v", err)
+			} else {
+				largeFanoutMQ = largeMQ
+				fanoutService.SetLargeFanoutPublisher(largeMQ)
+				largeFanoutWorker = feedworkers.NewLargeFanoutWorker(ch, fanoutService, processedEvents, rabbitmq.LargeFanoutQueueName)
+			}
 		}
 
-		// 死信重放：时间线 DLQ 与写扩散 DLQ 各启动一个消费者。
+		// 死信重放：时间线 DLQ、写扩散 DLQ、重度推送 DLQ 各启动一个消费者。
 		baseRMQ := &rabbitmq.RabbitMQ{Conn: conn, Ch: ch}
 		if timelineMQ, err := rabbitmq.NewTimelineMQ(baseRMQ); err != nil {
 			log.Printf("Failed to declare timeline topology for DLQ replayer: %v", err)
@@ -261,6 +288,14 @@ func main() {
 			if fanoutWorker != nil {
 				dlqReplayers = append(dlqReplayers, feedworkers.NewDLQReplayer(ch, timelineMQ, rabbitmq.FanoutDLQName))
 			}
+		}
+		// 重度推送死信重放：重新投递回重度推送交换机。
+		if heavyPushMQ != nil {
+			dlqReplayers = append(dlqReplayers, feedworkers.NewDLQReplayer(ch, heavyPushMQ, rabbitmq.HeavyPushDLQName))
+		}
+		// 大粉丝量写扩散死信重放。
+		if largeFanoutMQ != nil {
+			dlqReplayers = append(dlqReplayers, feedworkers.NewDLQReplayer(ch, largeFanoutMQ, rabbitmq.LargeFanoutDLQName))
 		}
 	}
 
@@ -318,10 +353,10 @@ func main() {
 	defer pprofServer.Close()
 
 	// 错误通道，用于捕获各个 Worker 运行时的错误
-	errCh := make(chan error, 6)
+	errCh := make(chan error, 8)
 	workerCount := 0 // 实际启动的 Worker 数量
 
-	// 依次开启 Social、Like、Comment、Popularity、Fanout 五个 Worker 的 goroutine
+	// 依次开启 Social、Like、Comment、Popularity、Fanout、HeavyPush、LargeFanout 七个 Worker 的 goroutine
 	if socialWorker != nil {
 		log.Printf("Worker started, consuming queue=%s", socialQueue)
 		go func() { errCh <- socialWorker.Run(ctx) }()
@@ -345,6 +380,16 @@ func main() {
 	if fanoutWorker != nil {
 		log.Printf("Worker started, consuming queue=%s", rabbitmq.FanoutQueueName)
 		go func() { errCh <- fanoutWorker.Run(ctx) }()
+		workerCount++
+	}
+	if heavyPushWorker != nil {
+		log.Printf("Worker started, consuming queue=%s", rabbitmq.HeavyPushQueueName)
+		go func() { errCh <- heavyPushWorker.Run(ctx) }()
+		workerCount++
+	}
+	if largeFanoutWorker != nil {
+		log.Printf("Worker started, consuming queue=%s", rabbitmq.LargeFanoutQueueName)
+		go func() { errCh <- largeFanoutWorker.Run(ctx) }()
 		workerCount++
 	}
 

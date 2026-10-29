@@ -69,3 +69,12 @@ type DependencyGuard interface {
 	// Record 记录依赖调用结果，err 非空表示依赖失败。
 	Record(name string, err error)
 }
+
+// FanoutProgressStore 写扩散断点续传进度端口。
+// 以 outbox 事件 ID 为粒度记录已写到的粉丝游标，失败重投时从断点继续。
+type FanoutProgressStore interface {
+	// Load 读取进度：cursor 为已写入的最后一个粉丝 ID，done 表示已全部写完。
+	Load(ctx context.Context, eventID string) (cursor uint, done bool, err error)
+	// Save 保存进度，done=true 表示本轮写扩散已经完成。
+	Save(ctx context.Context, eventID string, cursor uint, done bool) error
+}

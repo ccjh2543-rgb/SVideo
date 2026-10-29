@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	feedapp "feedsystem_video_go/internal/application/feed"
@@ -14,20 +15,33 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// defaultFanoutConcurrency 写扩散默认并发处理的消息数。
+// 单 goroutine 时一条大粉丝量消息会阻塞后续所有消息，工作池保证不同作者互不阻塞。
+const defaultFanoutConcurrency = 4
+
 // FanoutWorker 消费视频发布事件，执行推拉结合写扩散。
 type FanoutWorker struct {
-	ch      *amqp.Channel
-	service *feedapp.FanoutService
-	events  workers.EventIdempotency
-	queue   string
+	ch          *amqp.Channel
+	service     *feedapp.FanoutService
+	events      workers.EventIdempotency
+	queue       string
+	concurrency int
 }
 
 // NewFanoutWorker 创建写扩散 Worker。
 func NewFanoutWorker(ch *amqp.Channel, service *feedapp.FanoutService, events workers.EventIdempotency, queue string) *FanoutWorker {
-	return &FanoutWorker{ch: ch, service: service, events: events, queue: queue}
+	return &FanoutWorker{ch: ch, service: service, events: events, queue: queue, concurrency: defaultFanoutConcurrency}
 }
 
-// Run 启动消费循环。
+// SetConcurrency 设置并发处理的消息数，n <= 0 时使用默认值。
+func (w *FanoutWorker) SetConcurrency(n int) {
+	if w == nil || n <= 0 {
+		return
+	}
+	w.concurrency = n
+}
+
+// Run 启动消费循环与工作池。
 func (w *FanoutWorker) Run(ctx context.Context) error {
 	if w == nil || w.ch == nil || w.service == nil {
 		return errors.New("fanout worker is not initialized")
@@ -41,6 +55,27 @@ func (w *FanoutWorker) Run(ctx context.Context) error {
 		return err
 	}
 
+	concurrency := w.concurrency
+	if concurrency <= 0 {
+		concurrency = defaultFanoutConcurrency
+	}
+	jobs := make(chan amqp.Delivery)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				w.handleDelivery(ctx, d)
+			}
+		}()
+	}
+	// 退出时先关闭任务队列，等待正在处理的消息结束，避免 Ack/Nack 丢失。
+	defer func() {
+		close(jobs)
+		wg.Wait()
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -49,7 +84,11 @@ func (w *FanoutWorker) Run(ctx context.Context) error {
 			if !ok {
 				return errors.New("fanout deliveries channel closed")
 			}
-			w.handleDelivery(ctx, d)
+			select {
+			case jobs <- d:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 }
@@ -82,7 +121,7 @@ func (w *FanoutWorker) process(ctx context.Context, body []byte) error {
 			return nil
 		}
 	}
-	if err := w.service.Handle(ctx, event.VideoID, event.AuthorID, time.UnixMilli(event.CreateTime)); err != nil {
+	if err := w.service.Handle(ctx, event.EventID, event.VideoID, event.AuthorID, time.UnixMilli(event.CreateTime)); err != nil {
 		// 业务失败时删除幂等标记，保证 DLQ 重放或补偿任务能够重新处理。
 		if w.events != nil {
 			if unmarkErr := w.events.Unmark(ctx, "fanout", event.EventID); unmarkErr != nil {

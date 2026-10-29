@@ -154,7 +154,7 @@ func TestFanoutSmallCreatorWritesInboxAndOutbox(t *testing.T) {
 	)
 
 	createTime := time.UnixMilli(1760000000000)
-	if err := service.Handle(context.Background(), 9, 1, createTime); err != nil {
+	if err := service.Handle(context.Background(), "evt-1", 9, 1, createTime); err != nil {
 		t.Fatalf("fanout: %v", err)
 	}
 
@@ -178,7 +178,7 @@ func TestFanoutBigCreatorOnlyWritesOutbox(t *testing.T) {
 		2,
 	)
 
-	if err := service.Handle(context.Background(), 9, 1, time.Now()); err != nil {
+	if err := service.Handle(context.Background(), "evt-1", 9, 1, time.Now()); err != nil {
 		t.Fatalf("fanout: %v", err)
 	}
 	if len(timeline.outbox[1]) != 1 {
@@ -220,7 +220,7 @@ func TestFanoutBigCreatorPushesHeavyFollowers(t *testing.T) {
 	)
 	service.SetHeavyPush(NewHeavyPushService(&fakeHeavyFollowerReader{ids: []uint{2, 3}}, timeline, 1))
 
-	if err := service.Handle(context.Background(), 9, 1, time.Now()); err != nil {
+	if err := service.Handle(context.Background(), "evt-1", 9, 1, time.Now()); err != nil {
 		t.Fatalf("fanout: %v", err)
 	}
 	if len(timeline.outbox[1]) != 1 {
@@ -233,5 +233,202 @@ func TestFanoutBigCreatorPushesHeavyFollowers(t *testing.T) {
 	}
 	if len(timeline.inbox[4]) != 0 {
 		t.Fatalf("normal follower should not receive heavy push, got %+v", timeline.inbox[4])
+	}
+}
+
+// heavyPushCall 记录一次重度推送任务投递。
+type heavyPushCall struct {
+	EventID  string
+	VideoID  uint
+	AuthorID uint
+	Score    int64
+}
+
+// fakeHeavyPushPublisher 记录投递到独立队列的重度推送任务。
+type fakeHeavyPushPublisher struct {
+	calls []heavyPushCall
+}
+
+func (f *fakeHeavyPushPublisher) PublishHeavyPush(_ context.Context, eventID string, videoID, authorID uint, score int64) error {
+	f.calls = append(f.calls, heavyPushCall{EventID: eventID, VideoID: videoID, AuthorID: authorID, Score: score})
+	return nil
+}
+
+// TestFanoutBigCreatorPublishesHeavyPushTask 大 V 发布只投递任务，不在写扩散里同步推送。
+func TestFanoutBigCreatorPublishesHeavyPushTask(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	service := NewFanoutService(
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 100001, IsBig: true}},
+		&fakeFollowerReader{ids: []uint{2, 3, 4}},
+		timeline,
+		100000,
+		2,
+	)
+	publisher := &fakeHeavyPushPublisher{}
+	service.SetHeavyPushPublisher(publisher)
+
+	createTime := time.UnixMilli(1760000000000)
+	if err := service.Handle(context.Background(), "evt-7", 9, 1, createTime); err != nil {
+		t.Fatalf("fanout: %v", err)
+	}
+	if len(timeline.outbox[1]) != 1 {
+		t.Fatalf("expected outbox entry, got %+v", timeline.outbox[1])
+	}
+	if len(timeline.inbox) != 0 {
+		t.Fatalf("heavy push should be async, got inbox %+v", timeline.inbox)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("publish calls = %d, want 1", len(publisher.calls))
+	}
+	call := publisher.calls[0]
+	if call.EventID != "evt-7" || call.VideoID != 9 || call.AuthorID != 1 || call.Score != createTime.UnixMilli() {
+		t.Fatalf("unexpected publish call: %+v", call)
+	}
+}
+
+// largeFanoutCall 记录一次大粉丝量写扩散任务投递。
+type largeFanoutCall struct {
+	EventID  string
+	VideoID  uint
+	AuthorID uint
+	Score    int64
+}
+
+// fakeLargeFanoutPublisher 记录大粉丝量写扩散任务。
+type fakeLargeFanoutPublisher struct {
+	calls []largeFanoutCall
+}
+
+func (f *fakeLargeFanoutPublisher) PublishLargeFanout(_ context.Context, eventID string, videoID, authorID uint, score int64) error {
+	f.calls = append(f.calls, largeFanoutCall{EventID: eventID, VideoID: videoID, AuthorID: authorID, Score: score})
+	return nil
+}
+
+// TestFanoutLargeCreatorPublishesTask 粉丝数超过阈值的小 V 转独立队列。
+func TestFanoutLargeCreatorPublishesTask(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	service := NewFanoutService(
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 20000}},
+		&fakeFollowerReader{ids: []uint{2, 3, 4}},
+		timeline,
+		100000,
+		2,
+	)
+	publisher := &fakeLargeFanoutPublisher{}
+	service.SetLargeFanoutPublisher(publisher)
+
+	createTime := time.UnixMilli(1760000000000)
+	if err := service.Handle(context.Background(), "evt-8", 9, 1, createTime); err != nil {
+		t.Fatalf("fanout: %v", err)
+	}
+	if len(timeline.inbox) != 0 {
+		t.Fatalf("large fanout should be async, got inbox %+v", timeline.inbox)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("publish calls = %d, want 1", len(publisher.calls))
+	}
+	if publisher.calls[0].EventID != "evt-8" || publisher.calls[0].Score != createTime.UnixMilli() {
+		t.Fatalf("unexpected publish call: %+v", publisher.calls[0])
+	}
+}
+
+// fakeProgressSave 记录一次进度保存。
+type fakeProgressSave struct {
+	Cursor uint
+	Done   bool
+}
+
+// fakeFanoutProgress 内存进度存储。
+type fakeFanoutProgress struct {
+	cursor uint
+	done   bool
+	saves  []fakeProgressSave
+}
+
+func (f *fakeFanoutProgress) Load(_ context.Context, _ string) (uint, bool, error) {
+	return f.cursor, f.done, nil
+}
+
+func (f *fakeFanoutProgress) Save(_ context.Context, _ string, cursor uint, done bool) error {
+	f.saves = append(f.saves, fakeProgressSave{Cursor: cursor, Done: done})
+	return nil
+}
+
+// TestFanoutFollowersResumesFromCursor 断点续传只写未完成的粉丝。
+func TestFanoutFollowersResumesFromCursor(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	service := NewFanoutService(
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 3}},
+		&fakeFollowerReader{ids: []uint{2, 3, 4}},
+		timeline,
+		100000,
+		2,
+	)
+	progress := &fakeFanoutProgress{cursor: 3}
+	service.SetFanoutProgress(progress)
+
+	if err := service.FanoutFollowers(context.Background(), "evt-9", 9, 1, 1760000000000); err != nil {
+		t.Fatalf("fanout followers: %v", err)
+	}
+	if len(timeline.inbox[2]) != 0 || len(timeline.inbox[3]) != 0 {
+		t.Fatalf("should skip written followers, got %+v", timeline.inbox)
+	}
+	if len(timeline.inbox[4]) != 1 {
+		t.Fatalf("expected follower 4 to receive video, got %+v", timeline.inbox[4])
+	}
+	if len(progress.saves) == 0 || !progress.saves[len(progress.saves)-1].Done {
+		t.Fatalf("expected done progress, got %+v", progress.saves)
+	}
+}
+
+// TestFanoutFollowersSkipsFinishedEvent 已完成的写扩散重投时直接返回。
+func TestFanoutFollowersSkipsFinishedEvent(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	service := NewFanoutService(
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 3}},
+		&fakeFollowerReader{ids: []uint{2, 3, 4}},
+		timeline,
+		100000,
+		2,
+	)
+	progress := &fakeFanoutProgress{cursor: 4, done: true}
+	service.SetFanoutProgress(progress)
+
+	if err := service.FanoutFollowers(context.Background(), "evt-10", 9, 1, 1760000000000); err != nil {
+		t.Fatalf("fanout followers: %v", err)
+	}
+	if len(timeline.inbox) != 0 {
+		t.Fatalf("finished event should not write inbox, got %+v", timeline.inbox)
+	}
+}
+
+// TestFanoutFollowersSavesPageCursor 每页成功后保存游标，供失败重投续传。
+func TestFanoutFollowersSavesPageCursor(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	service := NewFanoutService(
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 4}},
+		&fakeFollowerReader{ids: []uint{2, 3, 4, 5}},
+		timeline,
+		100000,
+		2,
+	)
+	progress := &fakeFanoutProgress{}
+	service.SetFanoutProgress(progress)
+
+	if err := service.FanoutFollowers(context.Background(), "evt-11", 9, 1, 1760000000000); err != nil {
+		t.Fatalf("fanout followers: %v", err)
+	}
+	if len(progress.saves) != 3 {
+		t.Fatalf("saves = %+v, want 3", progress.saves)
+	}
+	if progress.saves[0].Cursor != 3 || progress.saves[0].Done {
+		t.Fatalf("first save = %+v, want cursor 3 not done", progress.saves[0])
+	}
+	if progress.saves[1].Cursor != 5 || progress.saves[1].Done {
+		t.Fatalf("second save = %+v, want cursor 5 not done", progress.saves[1])
+	}
+	last := progress.saves[2]
+	if last.Cursor != 5 || !last.Done {
+		t.Fatalf("last save = %+v, want cursor 5 done", last)
 	}
 }
