@@ -10,6 +10,10 @@ type TimelineEntry struct {
 	Score   int64
 }
 
+// DefaultInboxCapacity 粉丝 Inbox 的默认热窗口容量。
+// Inbox 只保存浅页热数据，更深的历史由数据库游标兜底。
+const DefaultInboxCapacity int64 = 300
+
 // TimelineRepository 推拉结合时间线仓储接口。
 //
 // Inbox：粉丝收件箱，小 V 发布时写扩散到这里。
@@ -17,6 +21,11 @@ type TimelineEntry struct {
 type TimelineRepository interface {
 	PushInbox(ctx context.Context, followerID uint, videoID uint, score int64) error
 	PushInboxBatch(ctx context.Context, followerIDs []uint, videoID uint, score int64) error
+	// PushInboxEntries 批量写入带各自分数的条目，用于新关注时回填作者历史视频。
+	PushInboxEntries(ctx context.Context, followerID uint, entries []TimelineEntry) error
+	// PushInboxEntriesWindow 只写入能进入 Inbox 容量窗口的条目。
+	// Inbox 未满时按剩余容量取最新条目；已满时只写比当前最老条目更新的条目。
+	PushInboxEntriesWindow(ctx context.Context, followerID uint, entries []TimelineEntry, capacity int64) error
 	PushOutbox(ctx context.Context, authorID uint, videoID uint, score int64) error
 
 	ReadInbox(ctx context.Context, userID uint, maxScore int64, limit int) ([]TimelineEntry, error)

@@ -21,13 +21,31 @@ type FollowingCacheInvalidator interface {
 	Invalidate(ctx context.Context, followerID uint) error
 }
 
+// HeavyRegistry 重度用户索引维护接口。
+type HeavyRegistry interface {
+	OnFollowBigV(ctx context.Context, uid, bigV uint) (becameHeavy bool, isHeavy bool, err error)
+	OnUnfollowBigV(ctx context.Context, uid, bigV uint) error
+	ListHeavyFollowing(ctx context.Context, uid uint) ([]uint, error)
+	TryBeginBackfill(ctx context.Context, uid uint) (bool, error)
+	MarkBackfilled(ctx context.Context, uid uint) error
+}
+
+// newFollowBackfillLimit 新关注时回填到粉丝 Inbox 的作者历史视频条数。
+// 取作者 Outbox 的近期内容即可，更早的历史仍由 DB 游标兜底。
+const newFollowBackfillLimit = 20
+
+// heavyBackfillLimit 新晋重度用户回填每个大 V 的条数。
+const heavyBackfillLimit = 20
+
 // SocialWorker 是处理社交关系（关注/取关）的消费者 Worker。
 // 它从 RabbitMQ 指定队列中消费 SocialEvent 消息，并调用 SocialRepository 持久化关系。
 type SocialWorker struct {
 	ch             *amqp.Channel
 	repo           domainsocial.Repository
+	stats          domainsocial.StatsRepository
 	timeline       domainfeed.TimelineRepository
 	followingCache FollowingCacheInvalidator
+	heavy          HeavyRegistry
 	events         workers.EventIdempotency
 	notifier       domainnotification.Notifier
 	queue          string
@@ -37,8 +55,10 @@ type SocialWorker struct {
 func NewSocialWorker(
 	ch *amqp.Channel,
 	repo domainsocial.Repository,
+	stats domainsocial.StatsRepository,
 	timeline domainfeed.TimelineRepository,
 	followingCache FollowingCacheInvalidator,
+	heavy HeavyRegistry,
 	events workers.EventIdempotency,
 	notifier domainnotification.Notifier,
 	queue string,
@@ -46,8 +66,10 @@ func NewSocialWorker(
 	return &SocialWorker{
 		ch:             ch,
 		repo:           repo,
+		stats:          stats,
 		timeline:       timeline,
 		followingCache: followingCache,
+		heavy:          heavy,
 		events:         events,
 		notifier:       notifier,
 		queue:          queue,
@@ -168,6 +190,10 @@ func (w *SocialWorker) applyFollow(ctx context.Context, evt *rabbitmq.SocialEven
 		return err
 	}
 	w.invalidateFollowing(ctx, evt.FollowerID)
+	// 新关注后把作者最近的视频回填到粉丝 Inbox，
+	// 避免“关注成功但首屏为空”，要等下一次发布才可见。
+	w.backfillInbox(ctx, evt.FollowerID, evt.VloggerID)
+	w.updateHeavyOnFollow(ctx, evt.FollowerID, evt.VloggerID)
 
 	if w.notifier != nil {
 		_ = w.notifier.Publish(ctx, domainnotification.Event{
@@ -198,6 +224,7 @@ func (w *SocialWorker) applyUnfollow(ctx context.Context, evt *rabbitmq.SocialEv
 	}
 	w.invalidateFollowing(ctx, evt.FollowerID)
 	w.cleanInbox(ctx, evt.FollowerID, evt.VloggerID)
+	w.removeHeavyOnUnfollow(ctx, evt.FollowerID, evt.VloggerID)
 	return nil
 }
 
@@ -209,13 +236,124 @@ func (w *SocialWorker) invalidateFollowing(ctx context.Context, followerID uint)
 	_ = w.followingCache.Invalidate(ctx, followerID) // 缓存失效失败不影响取关结果
 }
 
+// updateHeavyOnFollow 维护重度用户索引，并在跨入阈值时回填大 V 最近内容。
+func (w *SocialWorker) updateHeavyOnFollow(ctx context.Context, followerID, vloggerID uint) {
+	if w.heavy == nil || w.stats == nil {
+		return
+	}
+	stats, err := w.stats.Get(ctx, vloggerID)
+	if err != nil {
+		log.Printf("social worker: heavy stats failed vlogger=%d: %v", vloggerID, err)
+		return
+	}
+	if stats == nil || (!stats.IsBig && stats.FansCount < domainsocial.BigVFansThreshold) {
+		return
+	}
+
+	becameHeavy, isHeavy, err := w.heavy.OnFollowBigV(ctx, followerID, vloggerID)
+	if err != nil {
+		log.Printf("social worker: heavy follow failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
+		return
+	}
+	if !isHeavy {
+		return
+	}
+	if becameHeavy {
+		w.backfillAllHeavy(ctx, followerID)
+		return
+	}
+	w.backfillHeavyAuthor(ctx, followerID, vloggerID)
+}
+
+// removeHeavyOnUnfollow 维护重度用户索引。
+func (w *SocialWorker) removeHeavyOnUnfollow(ctx context.Context, followerID, vloggerID uint) {
+	if w.heavy == nil {
+		return
+	}
+	if err := w.heavy.OnUnfollowBigV(ctx, followerID, vloggerID); err != nil {
+		log.Printf("social worker: heavy unfollow failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
+	}
+}
+
+// backfillAllHeavy 新晋重度用户回填所有已关注大 V 的最近内容。
+// 只有全部成功才标记 backfilled；失败时锁自动过期，后续读路径仍走安全拉取。
+func (w *SocialWorker) backfillAllHeavy(ctx context.Context, followerID uint) {
+	started, err := w.heavy.TryBeginBackfill(ctx, followerID)
+	if err != nil || !started {
+		return
+	}
+	members, err := w.heavy.ListHeavyFollowing(ctx, followerID)
+	if err != nil {
+		log.Printf("social worker: heavy following list failed follower=%d: %v", followerID, err)
+		return
+	}
+	for _, vloggerID := range members {
+		if !w.backfillHeavyAuthor(ctx, followerID, vloggerID) {
+			return
+		}
+	}
+	if err := w.heavy.MarkBackfilled(ctx, followerID); err != nil {
+		log.Printf("social worker: mark heavy backfilled failed follower=%d: %v", followerID, err)
+	}
+}
+
+// backfillHeavyAuthor 把某个大 V 最近内容回填到重度粉丝 Inbox。
+// 返回 false 表示本次回填失败，调用方不能标记 backfilled。
+func (w *SocialWorker) backfillHeavyAuthor(ctx context.Context, followerID, vloggerID uint) bool {
+	if w.timeline == nil {
+		return true
+	}
+	entries, err := w.timeline.ReadOutbox(ctx, vloggerID, 0, heavyBackfillLimit)
+	if err != nil {
+		log.Printf("social worker: heavy backfill read failed vlogger=%d: %v", vloggerID, err)
+		return false
+	}
+	if len(entries) == 0 {
+		return true
+	}
+	if err := w.timeline.PushInboxEntriesWindow(ctx, followerID, entries, domainfeed.DefaultInboxCapacity); err != nil {
+		log.Printf("social worker: heavy backfill push failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
+		return false
+	}
+	return true
+}
+
+// backfillInbox 把作者 Outbox 中最近的视频回填到新粉丝的 Inbox。
+//
+// 只对小 V 回填：大 V 本就走读时拉取 Outbox，粉丝第一次刷新就能看到，
+// 回填反而会放大写扩散。回填失败不影响关注结果，历史内容仍可通过 DB 兜底。
+func (w *SocialWorker) backfillInbox(ctx context.Context, followerID, vloggerID uint) {
+	if w.timeline == nil || w.stats == nil || followerID == 0 || vloggerID == 0 {
+		return
+	}
+	stats, err := w.stats.Get(ctx, vloggerID)
+	if err != nil {
+		log.Printf("social worker: get stats failed vlogger=%d: %v", vloggerID, err)
+		return
+	}
+	if stats != nil && (stats.IsBig || stats.FansCount >= domainsocial.BigVFansThreshold) {
+		return
+	}
+	entries, err := w.timeline.ReadOutbox(ctx, vloggerID, 0, newFollowBackfillLimit)
+	if err != nil {
+		log.Printf("social worker: backfill read outbox failed vlogger=%d: %v", vloggerID, err)
+		return
+	}
+	if len(entries) == 0 {
+		return
+	}
+	if err := w.timeline.PushInboxEntriesWindow(ctx, followerID, entries, domainfeed.DefaultInboxCapacity); err != nil {
+		log.Printf("social worker: backfill inbox failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
+	}
+}
+
 // cleanInbox 删除粉丝 Inbox 中该作者最近的视频。
-// Outbox 只保留最近 100 条，更早的残留由读路径按关注集合过滤兜底。
+// Outbox 只保留最近 50 条，更早的残留由读路径按关注集合过滤兜底。
 func (w *SocialWorker) cleanInbox(ctx context.Context, followerID, vloggerID uint) {
 	if w.timeline == nil {
 		return
 	}
-	entries, err := w.timeline.ReadOutbox(ctx, vloggerID, 0, 100)
+	entries, err := w.timeline.ReadOutbox(ctx, vloggerID, 0, 50)
 	if err != nil {
 		log.Printf("social worker: read outbox failed vlogger=%d: %v", vloggerID, err)
 		return

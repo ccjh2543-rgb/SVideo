@@ -2,7 +2,6 @@ package video
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	domainvideo "feedsystem_video_go/internal/domain/video"
@@ -119,33 +118,36 @@ func (r *LikeRepository) ListLikedVideos(ctx context.Context, accountID uint) ([
 }
 
 // LikeWithCounters 在事务中完成点赞和计数更新。
+// 使用唯一索引 + 原子 UPDATE，避免 SELECT ... FOR UPDATE 让热点视频的点赞串行化。
 func (r *LikeRepository) LikeWithCounters(ctx context.Context, videoID, accountID uint) (bool, error) {
 	created := false
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("id").First(&VideoModel{}, videoID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return domainvideo.ErrVideoNotFound
-			}
-			return err
-		}
-		if err := tx.Create(&LikeModel{
+		// 唯一索引保证幂等；RowsAffected=0 表示重复点赞。
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&LikeModel{
 			VideoID:   videoID,
 			AccountID: accountID,
 			CreatedAt: time.Now(),
-		}).Error; err != nil {
-			if util.IsDuplicateEntry(err) {
+		})
+		if result.Error != nil {
+			if util.IsDuplicateEntry(result.Error) {
 				return domainvideo.ErrAlreadyLiked
 			}
-			return err
+			return result.Error
 		}
-		if err := tx.Model(&VideoModel{}).Where("id = ?", videoID).
-			UpdateColumn("likes_count", gorm.Expr("likes_count + 1")).Error; err != nil {
-			return err
+		if result.RowsAffected == 0 {
+			return domainvideo.ErrAlreadyLiked
 		}
-		if err := tx.Model(&VideoModel{}).Where("id = ?", videoID).
-			UpdateColumn("popularity", gorm.Expr("popularity + 1")).Error; err != nil {
-			return err
+
+		// 关系插入成功后再原子增加计数；视频不存在时 UPDATE 影响 0 行，事务回滚。
+		update := tx.Model(&VideoModel{}).Where("id = ?", videoID).Updates(map[string]interface{}{
+			"likes_count": gorm.Expr("likes_count + 1"),
+			"popularity":  gorm.Expr("popularity + 1"),
+		})
+		if update.Error != nil {
+			return update.Error
+		}
+		if update.RowsAffected == 0 {
+			return domainvideo.ErrVideoNotFound
 		}
 		created = true
 		return nil
@@ -164,13 +166,14 @@ func (r *LikeRepository) UnlikeWithCounters(ctx context.Context, videoID, accoun
 		if result.RowsAffected == 0 {
 			return domainvideo.ErrNotLiked
 		}
-		if err := tx.Model(&VideoModel{}).Where("id = ?", videoID).
-			UpdateColumn("likes_count", gorm.Expr("GREATEST(likes_count - 1, 0)")).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&VideoModel{}).Where("id = ?", videoID).
-			UpdateColumn("popularity", gorm.Expr("GREATEST(popularity - 1, 0)")).Error; err != nil {
-			return err
+
+		// 两个计数合并成一次 UPDATE，缩短持有行锁的时间。
+		update := tx.Model(&VideoModel{}).Where("id = ?", videoID).Updates(map[string]interface{}{
+			"likes_count": gorm.Expr("GREATEST(likes_count - 1, 0)"),
+			"popularity":  gorm.Expr("GREATEST(popularity - 1, 0)"),
+		})
+		if update.Error != nil {
+			return update.Error
 		}
 		deleted = true
 		return nil

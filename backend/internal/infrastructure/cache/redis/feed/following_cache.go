@@ -24,6 +24,7 @@ type followingStatDTO struct {
 	AuthorID        uint  `json:"author_id"`
 	FansCount       int64 `json:"fans_count"`
 	IsBig           bool  `json:"is_big"`
+	WasBig          bool  `json:"was_big"`
 	LastPublishTime int64 `json:"last_publish_time"` // 毫秒时间戳，0 表示未发布
 }
 
@@ -64,6 +65,7 @@ func (c *FollowingCache) Get(ctx context.Context, followerID uint) ([]*domainsoc
 			AuthorID:  row.AuthorID,
 			FansCount: row.FansCount,
 			IsBig:     row.IsBig,
+			WasBig:    row.WasBig,
 		}
 		if row.LastPublishTime > 0 {
 			item.LastPublishTime = time.UnixMilli(row.LastPublishTime)
@@ -92,6 +94,7 @@ func (c *FollowingCache) Set(ctx context.Context, followerID uint, stats []*doma
 			AuthorID:        item.AuthorID,
 			FansCount:       item.FansCount,
 			IsBig:           item.IsBig,
+			WasBig:          item.WasBig,
 			LastPublishTime: lastPublish,
 		})
 	}

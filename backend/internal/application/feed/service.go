@@ -34,6 +34,10 @@ const (
 	defaultBigVBatchSize = 32
 	// defaultBigVMergeBudget 大 V 归并的时间预算。
 	defaultBigVMergeBudget = 50 * time.Millisecond
+	// heavyMigrationBackfillLimit 存量重度用户懒迁移时每个大 V 回填的条数。
+	heavyMigrationBackfillLimit = 20
+	// heavyMigrationTimeout 存量重度用户懒迁移的总预算，避免后台任务无限挂起。
+	heavyMigrationTimeout = 2 * time.Minute
 )
 
 // errTimelineEmpty 表示时间线中没有任何可用数据，需要回源数据库。
@@ -55,11 +59,13 @@ type FeedService struct {
 	timelineRepo    domainfeed.TimelineRepository
 	creatorRepo     domainsocial.StatsRepository
 	followingCache  FollowingCache
+	heavyUserCache  HeavyUserCache
 	guard           DependencyGuard
 	dbFallback      chan struct{}
 	bigVBatchSize   int
 	bigVMergeBudget time.Duration
 	requestGroup    singleflight.Group
+	heavyMigrating  sync.Map
 }
 
 // NewFeedService 创建 Feed 应用服务。
@@ -71,6 +77,7 @@ func NewFeedService(
 	timelineRepo domainfeed.TimelineRepository,
 	creatorRepo domainsocial.StatsRepository,
 	followingCache FollowingCache,
+	heavyUserCache HeavyUserCache,
 	guard DependencyGuard,
 ) *FeedService {
 	return &FeedService{
@@ -81,6 +88,7 @@ func NewFeedService(
 		timelineRepo:    timelineRepo,
 		creatorRepo:     creatorRepo,
 		followingCache:  followingCache,
+		heavyUserCache:  heavyUserCache,
 		guard:           guard,
 		dbFallback:      make(chan struct{}, dbFallbackConcurrency),
 		bigVBatchSize:   defaultBigVBatchSize,
@@ -378,9 +386,31 @@ func (s *FeedService) ListByFollowing(ctx context.Context, limit int, latestBefo
 	}
 
 	if s.timelineRepo != nil && s.creatorRepo != nil {
+		// 重度用户的大 V 内容已经通过选择性推进入 Inbox，读路径可以跳过 Outbox 拉取。
+		heavy := false
+		if s.heavyUserCache != nil {
+			value, err := s.heavyUserCache.IsHeavy(ctx, viewerAccountID)
+			if err != nil {
+				log.Printf("following feed: read heavy flag failed user=%d: %v", viewerAccountID, err)
+			} else {
+				heavy = value
+			}
+			// 重度标记已存在但历史内容还没回填完时，继续走普通推拉路径，
+			// 避免读路径提前跳过已登记大 V 的 Outbox 造成内容断层。
+			if heavy {
+				backfilled, err := s.heavyUserCache.IsBackfilled(ctx, viewerAccountID)
+				if err != nil {
+					log.Printf("following feed: read heavy backfill failed user=%d: %v", viewerAccountID, err)
+					heavy = false
+				} else if !backfilled {
+					heavy = false
+				}
+			}
+		}
+
 		// Redis 阶段只给有限预算，超时后立刻走数据库降级，避免拖长整个请求。
 		hybridCtx, cancel := context.WithTimeout(ctx, followingHybridBudget)
-		resp, err := s.listByFollowingHybrid(hybridCtx, limit, latestBefore, latestID, viewerAccountID)
+		resp, err := s.listByFollowingHybrid(hybridCtx, limit, latestBefore, latestID, viewerAccountID, heavy)
 		cancel()
 		if err == nil {
 			return resp, nil
@@ -425,8 +455,72 @@ func (s *FeedService) listByFollowingFromDBGuarded(ctx context.Context, limit in
 	return result, nil
 }
 
+// startHeavyMigration 懒迁移存量重度用户。
+//
+// 触发条件：用户关注的大 V 数已达到重度阈值，但还没有重度标记或回填未完成。
+// 迁移在后台执行，当前请求继续走普通推拉路径；完成后下一次请求才会走重度路径。
+func (s *FeedService) startHeavyMigration(uid uint, stats []*domainsocial.Stats) {
+	if uid == 0 || s.heavyUserCache == nil || s.timelineRepo == nil || len(stats) == 0 {
+		return
+	}
+	bigVIDs := make([]uint, 0, len(stats))
+	for _, item := range stats {
+		if item == nil || item.AuthorID == 0 {
+			continue
+		}
+		// 只登记当前仍是大 V 的作者；WasBig 已变小 V，历史内容继续走 Outbox。
+		if item.IsBig || item.FansCount >= domainsocial.BigVFansThreshold {
+			bigVIDs = append(bigVIDs, item.AuthorID)
+		}
+	}
+	if len(bigVIDs) < int(domainsocial.HeavyEnterThreshold) {
+		return
+	}
+	if _, loaded := s.heavyMigrating.LoadOrStore(uid, struct{}{}); loaded {
+		return
+	}
+
+	go func() {
+		defer s.heavyMigrating.Delete(uid)
+		ctx, cancel := context.WithTimeout(context.Background(), heavyMigrationTimeout)
+		defer cancel()
+
+		started, err := s.heavyUserCache.TryBeginBackfill(ctx, uid)
+		if err != nil || !started {
+			return
+		}
+		if _, err := s.heavyUserCache.EnsureHeavy(ctx, uid, bigVIDs); err != nil {
+			log.Printf("heavy migration: ensure heavy failed user=%d: %v", uid, err)
+			return
+		}
+		members, err := s.heavyUserCache.ListHeavyFollowing(ctx, uid)
+		if err != nil {
+			log.Printf("heavy migration: list heavy following failed user=%d: %v", uid, err)
+			return
+		}
+		for _, authorID := range members {
+			entries, err := s.timelineRepo.ReadOutbox(ctx, authorID, 0, heavyMigrationBackfillLimit)
+			if err != nil {
+				log.Printf("heavy migration: read outbox failed user=%d author=%d: %v", uid, authorID, err)
+				return
+			}
+			if len(entries) == 0 {
+				continue
+			}
+			if err := s.timelineRepo.PushInboxEntriesWindow(ctx, uid, entries, domainfeed.DefaultInboxCapacity); err != nil {
+				log.Printf("heavy migration: push inbox failed user=%d author=%d: %v", uid, authorID, err)
+				return
+			}
+		}
+		if err := s.heavyUserCache.MarkBackfilled(ctx, uid); err != nil {
+			log.Printf("heavy migration: mark backfilled failed user=%d: %v", uid, err)
+		}
+	}()
+}
+
 // listByFollowingHybrid 合并 Inbox、大 V Outbox 和自己的 Outbox。
-func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, latestBefore time.Time, latestID uint, viewerAccountID uint) (FollowingResult, error) {
+// heavy=true 表示选择性推已覆盖大 V 内容，只读 Inbox + 自己 Outbox。
+func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, latestBefore time.Time, latestID uint, viewerAccountID uint, heavy bool) (FollowingResult, error) {
 	cursorMs := int64(0)
 	if !latestBefore.IsZero() {
 		cursorMs = latestBefore.UnixMilli()
@@ -442,19 +536,57 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		return FollowingResult{}, err
 	}
 
-	bigVStats := make([]*domainsocial.Stats, 0)
 	// allowedAuthors 既用于挑选大 V，也用于读时过滤：
 	// 取关后 Inbox 里可能残留旧视频，按当前关注集合过滤可以立即生效。
 	allowedAuthors := make(map[uint]struct{}, len(stats)+1)
 	allowedAuthors[viewerAccountID] = struct{}{}
+	bigVIDs := make([]uint, 0)
 	for _, item := range stats {
 		if item == nil || item.AuthorID == 0 {
 			continue
 		}
 		allowedAuthors[item.AuthorID] = struct{}{}
-		if item.IsBig || item.FansCount >= domainsocial.BigVFansThreshold {
+		if item.IsBig || item.WasBig || item.FansCount >= domainsocial.BigVFansThreshold {
+			bigVIDs = append(bigVIDs, item.AuthorID)
+		}
+	}
+
+	// 存量用户的重度索引由后台懒迁移建立；迁移完成前继续走普通推拉路径，
+	// 避免“刚标记重度但 Inbox 还没回填”导致大 V 内容缺失。
+	pushedBigV := make(map[uint]struct{}, len(bigVIDs))
+	if heavy && s.heavyUserCache != nil {
+		registered, err := s.heavyUserCache.ListHeavyFollowing(ctx, viewerAccountID)
+		if err != nil {
+			log.Printf("following feed: list heavy following failed user=%d: %v", viewerAccountID, err)
+			heavy = false
+		} else {
+			for _, id := range registered {
+				pushedBigV[id] = struct{}{}
+			}
+		}
+	}
+
+	bigVStats := make([]*domainsocial.Stats, 0)
+	for _, item := range stats {
+		if item == nil || item.AuthorID == 0 {
+			continue
+		}
+		if item.IsBig || item.WasBig || item.FansCount >= domainsocial.BigVFansThreshold {
+			// 只有“当前仍是大 V”且已登记到反向索引的作者才能跳过 Outbox。
+			// WasBig 的作者已经变小 V，历史内容只在 Outbox，必须继续拉取或依赖降级回填。
+			if heavy && (item.IsBig || item.FansCount >= domainsocial.BigVFansThreshold) {
+				if _, pushed := pushedBigV[item.AuthorID]; pushed {
+					continue
+				}
+			}
 			bigVStats = append(bigVStats, item)
 		}
+	}
+
+	// 存量用户没有重度索引时，读路径懒触发一次后台迁移：
+	// 建立双向索引并回填大 V 最近内容，完成前继续走普通推拉路径。
+	if !heavy && len(bigVStats) >= int(domainsocial.HeavyEnterThreshold) {
+		s.startHeavyMigration(viewerAccountID, bigVStats)
 	}
 
 	// 多取 50 条，覆盖同一毫秒发布多条视频的情况
@@ -472,11 +604,16 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 	}
 	entries = append(entries, ownEntries...)
 
-	// 大 V 数量不设上限：按上界排序、分批读取、预算用尽时用水位线保证不跨过未读数据。
-	bigVEntries, unreadUpper, partial, err := s.mergeBigVOutboxes(ctx, bigVStats, cursorMs, latestID, limit)
-	if err != nil {
-		s.recordDependency(breakerRedisFeed, err)
-		return FollowingResult{}, err
+	bigVEntries := []domainfeed.TimelineEntry(nil)
+	unreadUpper := int64(-1)
+	partial := false
+	if len(bigVStats) > 0 {
+		// 大 V 数量不设上限：按上界排序、分批读取、预算用尽时用水位线保证不跨过未读数据。
+		bigVEntries, unreadUpper, partial, err = s.mergeBigVOutboxes(ctx, bigVStats, cursorMs, latestID, limit)
+		if err != nil {
+			s.recordDependency(breakerRedisFeed, err)
+			return FollowingResult{}, err
+		}
 	}
 	s.recordDependency(breakerRedisFeed, nil)
 	entries = append(entries, bigVEntries...)
@@ -485,7 +622,9 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		entries = filterEntriesAbove(entries, unreadUpper)
 	}
 	entries = filterTimelineEntries(entries, cursorMs, latestID)
-	merged := mergeTimelineEntries(entries, limit)
+	// 保留全部候选而不是先截到 limit：前几条视频可能已被删除/取关，
+	// 先截断会导致本页变短；这里按候选顺序继续向后取，直到凑满一页。
+	merged := mergeTimelineEntries(entries, 0)
 	if len(merged) == 0 {
 		// 第一页为空可能是新用户或缓存被清空；
 		// 非第一页为空可能是 Inbox 已被裁剪。
@@ -493,27 +632,45 @@ func (s *FeedService) listByFollowingHybrid(ctx context.Context, limit int, late
 		return FollowingResult{}, errTimelineEmpty
 	}
 
-	videoIDs := make([]uint, 0, len(merged))
+	candidateIDs := make([]uint, 0, len(merged))
 	for _, entry := range merged {
-		videoIDs = append(videoIDs, entry.VideoID)
+		candidateIDs = append(candidateIDs, entry.VideoID)
 	}
-	videos, err := s.getVideoByIDs(ctx, videoIDs)
-	if err != nil {
-		return FollowingResult{}, err
+
+	// 按页大小分批取视频：只有命中已删除/已取关内容时才继续向后取，
+	// 正常路径仍然只查 limit 条，避免一次把几百个 ID 全部查出。
+	videos := make([]*domainvideo.Video, 0, limit)
+	consumed := 0
+	for consumed < len(candidateIDs) && len(videos) < limit {
+		batchSize := limit - len(videos)
+		if batchSize < 1 {
+			batchSize = 1
+		}
+		end := consumed + batchSize
+		if end > len(candidateIDs) {
+			end = len(candidateIDs)
+		}
+		batchVideos, err := s.getVideoByIDs(ctx, candidateIDs[consumed:end])
+		if err != nil {
+			return FollowingResult{}, err
+		}
+		videos = append(videos, filterVideosByAuthors(batchVideos, allowedAuthors)...)
+		consumed = end
 	}
-	videos = filterVideosByAuthors(videos, allowedAuthors)
 	if len(videos) == 0 {
 		// 命中的条目全部来自已取关作者或已被删除，回源数据库重新取一页。
 		return FollowingResult{}, errTimelineEmpty
 	}
+	videos, hasMoreCandidates := assembleFollowingPage(videos, consumed, len(candidateIDs), limit)
 	items, err := s.buildFeedItems(ctx, videos, viewerAccountID)
 	if err != nil {
 		return FollowingResult{}, err
 	}
 
-	// 预算截断时用数据库补齐本页，避免返回过小的页；未截断时保持纯 Redis 结果。
-	hasMore := len(items) == limit || partial
-	if partial && len(items) < limit {
+	// has_more 的语义是“还有候选”，而不是“本页刚好满”。
+	// 预算截断或候选耗尽且本页不足时，用 DB 继续补页。
+	hasMore := hasMoreCandidates || partial
+	if len(items) < limit {
 		items, hasMore, err = s.fillFollowingFromDB(ctx, items, limit, viewerAccountID)
 		if err != nil {
 			return FollowingResult{}, err
@@ -847,6 +1004,22 @@ func filterVideosByAuthors(videos []*domainvideo.Video, allowed map[uint]struct{
 	return filtered
 }
 
+// assembleFollowingPage 从候选视频中截取一页，并判断是否还有未消费的候选。
+//
+// consumed 是已经取过视频的候选条目数，candidateCount 是全部候选数。
+// 只有“还有候选没取”或“本页超过 limit”才说明后面还有内容；
+// 候选已取完且视频不足一页时交给 DB 补页，避免误报 has_more。
+func assembleFollowingPage(videos []*domainvideo.Video, consumed, candidateCount, limit int) ([]*domainvideo.Video, bool) {
+	if limit <= 0 {
+		return nil, false
+	}
+	hasMore := consumed < candidateCount || len(videos) > limit
+	if len(videos) > limit {
+		videos = videos[:limit]
+	}
+	return videos, hasMore
+}
+
 // mergeTimelineEntries 对多个来源的时间线去重并按时间倒序排序。
 func mergeTimelineEntries(entries []domainfeed.TimelineEntry, limit int) []domainfeed.TimelineEntry {
 	byVideoID := make(map[uint]int64, len(entries))
@@ -876,7 +1049,7 @@ func mergeTimelineEntries(entries []domainfeed.TimelineEntry, limit int) []domai
 }
 
 // ListByPopularity 按热度降序查询推荐流。
-// 正常路径使用 24 小时桶线性衰减合并快照；Redis 不可用时回退数据库三字段游标。
+// 正常路径使用 24 小时桶指数衰减合并快照；Redis 不可用时回退数据库三字段游标。
 func (s *FeedService) ListByPopularity(ctx context.Context, limit int, reqAsOf int64, offset int, viewerAccountID uint, latestPopularity int64, latestBefore time.Time, latestIDBefore uint) (PopularityResult, error) {
 	if s.ranking != nil && (s.guard == nil || s.guard.Allow(breakerRedisPopularity)) {
 		asOf := time.Now().UTC().Truncate(time.Hour)
@@ -884,7 +1057,7 @@ func (s *FeedService) ListByPopularity(ctx context.Context, limit int, reqAsOf i
 			asOf = time.Unix(reqAsOf, 0).UTC().Truncate(time.Hour)
 		}
 
-		dest := "hot:video:merge:1h:" + asOf.Format("2006010215")
+		dest := domainfeed.HotSnapshotKey(asOf)
 
 		// 快照由离线任务预生成，请求路径只读，绝不做 ZUNIONSTORE。
 		readCtx, readCancel := context.WithTimeout(ctx, 80*time.Millisecond)
@@ -974,36 +1147,12 @@ func (s *FeedService) ListByPopularity(ctx context.Context, limit int, reqAsOf i
 
 // HotWindowKeys 导出给离线快照任务复用，保证在线与离线的时间窗口一致。
 func HotWindowKeys(asOf time.Time, hours int) []string {
-	return hotWindowKeys(asOf, hours)
+	return domainfeed.HotTopWindowKeys(asOf, hours)
 }
 
-// LinearDecayWeights 导出给离线快照任务复用。
-func LinearDecayWeights(hours int) []float64 {
-	return linearDecayWeights(hours)
-}
-
-// hotWindowKeys 生成从 asOf 往前共 hours 个小时桶的 key。
-func hotWindowKeys(asOf time.Time, hours int) []string {
-	if hours <= 0 {
-		return nil
-	}
-	keys := make([]string, 0, hours)
-	for i := 0; i < hours; i++ {
-		keys = append(keys, "hot:video:1h:"+asOf.Add(-time.Duration(i)*time.Hour).Format("2006010215"))
-	}
-	return keys
-}
-
-// linearDecayWeights 生成线性衰减权重：最新小时为 1.0，最老小时为 1/hours。
-func linearDecayWeights(hours int) []float64 {
-	if hours <= 0 {
-		return nil
-	}
-	weights := make([]float64, hours)
-	for i := 0; i < hours; i++ {
-		weights[i] = float64(hours-i) / float64(hours)
-	}
-	return weights
+// ExponentialDecayWeights 导出给离线快照任务复用。
+func ExponentialDecayWeights(asOf time.Time, hours int, halfLife time.Duration) []float64 {
+	return domainfeed.HotDecayWeights(asOf, hours, halfLife)
 }
 
 // buildFeedItems 组装展示模型，并批量填充当前用户的点赞状态。

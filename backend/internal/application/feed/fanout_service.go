@@ -21,6 +21,7 @@ type FanoutService struct {
 	timeline  domainfeed.TimelineRepository
 	threshold int64
 	batchSize int
+	heavy     *HeavyPushService
 }
 
 // NewFanoutService 创建写扩散服务。
@@ -44,6 +45,14 @@ func NewFanoutService(
 		threshold: threshold,
 		batchSize: batchSize,
 	}
+}
+
+// SetHeavyPush 注入重度粉丝推送服务；未注入时保持原有大 V 纯拉模式。
+func (s *FanoutService) SetHeavyPush(heavy *HeavyPushService) {
+	if s == nil {
+		return
+	}
+	s.heavy = heavy
 }
 
 // Handle 处理一条视频发布事件。
@@ -70,6 +79,10 @@ func (s *FanoutService) Handle(ctx context.Context, videoID uint, authorID uint,
 		return err
 	}
 	if stats.IsBig || stats.FansCount >= s.threshold {
+		// 大 V 不做全量写扩散，但向少数重度粉丝选择性推送。
+		if s.heavy != nil {
+			return s.heavy.Push(ctx, videoID, authorID, score)
+		}
 		return nil
 	}
 

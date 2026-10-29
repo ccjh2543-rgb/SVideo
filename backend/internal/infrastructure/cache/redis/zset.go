@@ -14,6 +14,38 @@ func (c *Client) ZincrBy(ctx context.Context, key string, member string, score f
 	return c.rdb.ZIncrBy(ctx, key, score, member).Err()
 }
 
+// ZIncrByItem 一条批量 ZINCRBY 指令。
+type ZIncrByItem struct {
+	Key    string
+	Member string
+	Score  float64
+}
+
+// ZIncrByBatch 使用 Pipeline 批量执行 ZINCRBY，并为涉及的 key 设置 TTL。
+// 用于热度事件批量聚合，避免每个事件一次网络往返。
+func (c *Client) ZIncrByBatch(ctx context.Context, items []ZIncrByItem, ttl time.Duration) error {
+	if c == nil || c.rdb == nil || len(items) == 0 {
+		return nil
+	}
+
+	pipe := c.rdb.Pipeline()
+	touched := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item.Key == "" || item.Member == "" || item.Score == 0 {
+			continue
+		}
+		pipe.ZIncrBy(ctx, item.Key, item.Score, item.Member)
+		touched[item.Key] = struct{}{}
+	}
+	if ttl > 0 {
+		for key := range touched {
+			pipe.Expire(ctx, key, ttl)
+		}
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 func (c *Client) ZAdd(ctx context.Context, key string, members ...redis.Z) error {
 	if c == nil || c.rdb == nil {
 		return nil
@@ -33,6 +65,14 @@ func (c *Client) ZRangeWithScores(ctx context.Context, key string, start int64, 
 		return nil, nil
 	}
 	return c.rdb.ZRangeWithScores(ctx, key, start, stop).Result()
+}
+
+// ZCard 返回 ZSET 成员数量。
+func (c *Client) ZCard(ctx context.Context, key string) (int64, error) {
+	if c == nil || c.rdb == nil {
+		return 0, nil
+	}
+	return c.rdb.ZCard(ctx, key).Result()
 }
 
 func (c *Client) Expire(ctx context.Context, key string, ttl time.Duration) error {

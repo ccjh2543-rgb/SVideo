@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	domainfeed "feedsystem_video_go/internal/domain/feed"
 	domainvideo "feedsystem_video_go/internal/domain/video"
 	rediscache "feedsystem_video_go/internal/infrastructure/cache/redis"
 
@@ -81,9 +82,47 @@ func (c *RankingCache) LatestIDs(ctx context.Context, maxScore int64, limit int)
 	return parseIDs(members), nil
 }
 
+// PromoteCandidates 将小时候选桶合并为 Top 桶，并裁剪到固定上限。
+// 候选桶只负责累计，Top 桶只负责排序与快照，避免裁剪丢累计值。
+func (c *RankingCache) PromoteCandidates(ctx context.Context, hour time.Time, shards int, topLimit int64) error {
+	if c == nil || c.cache == nil {
+		return nil
+	}
+	keys := domainfeed.HotCandidateKeys(hour, shards)
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// 候选桶过期或为空时保留已有 Top 桶，避免重建把历史 Top 清空。
+	hasCandidate := false
+	for _, key := range keys {
+		exists, err := c.cache.Exists(ctx, key)
+		if err != nil {
+			return err
+		}
+		if exists {
+			hasCandidate = true
+			break
+		}
+	}
+	if !hasCandidate {
+		return nil
+	}
+
+	topKey := domainfeed.HotTopKey(hour)
+	if err := c.cache.ZUnionStore(ctx, topKey, keys, "SUM"); err != nil {
+		return err
+	}
+	if topLimit > 0 {
+		if err := c.cache.ZRemRangeByRank(ctx, topKey, 0, -(topLimit + 1)); err != nil {
+			return err
+		}
+	}
+	return c.cache.Expire(ctx, topKey, domainfeed.HotTopTTL)
+}
+
 // EnsureSnapshot 确保热榜合并快照存在。
 // 快照不存在时按小时桶和权重合并，并设置固定 TTL，保证同一 as_of 下翻页稳定。
-// 使用分布式锁保证同一时刻只有一个实例执行 ZUNIONSTORE，避免并发阻塞 Redis。
 func (c *RankingCache) EnsureSnapshot(ctx context.Context, dest string, keys []string, weights []float64) error {
 	if c == nil || c.cache == nil || dest == "" || len(keys) == 0 {
 		return nil
@@ -91,6 +130,15 @@ func (c *RankingCache) EnsureSnapshot(ctx context.Context, dest string, keys []s
 	exists, err := c.cache.Exists(ctx, dest)
 	if err != nil || exists {
 		return err
+	}
+	return c.RefreshSnapshot(ctx, dest, keys, weights)
+}
+
+// RefreshSnapshot 强制重建热榜快照。
+// 用于离线构建任务按分钟刷新；请求路径只读，不调用本方法。
+func (c *RankingCache) RefreshSnapshot(ctx context.Context, dest string, keys []string, weights []float64) error {
+	if c == nil || c.cache == nil || dest == "" || len(keys) == 0 {
+		return nil
 	}
 
 	lockKey := "lock:" + dest
@@ -107,11 +155,6 @@ func (c *RankingCache) EnsureSnapshot(ctx context.Context, dest string, keys []s
 		_ = c.cache.Unlock(context.Background(), lockKey, token)
 	}()
 
-	// 双重检查：等锁期间可能已被其他实例构建完成。
-	exists, err = c.cache.Exists(ctx, dest)
-	if err != nil || exists {
-		return err
-	}
 	if err := c.cache.ZUnionStoreWeighted(ctx, dest, keys, weights, "SUM"); err != nil {
 		return err
 	}

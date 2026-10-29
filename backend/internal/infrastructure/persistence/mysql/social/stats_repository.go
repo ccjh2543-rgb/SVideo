@@ -34,6 +34,7 @@ func (r *StatsRepository) Get(ctx context.Context, authorID uint) (*domainsocial
 		AuthorID:  model.AuthorID,
 		FansCount: model.FansCount,
 		IsBig:     model.IsBig,
+		WasBig:    model.WasBig,
 	}
 	if model.LastPublishTime != nil {
 		stats.LastPublishTime = *model.LastPublishTime
@@ -62,18 +63,31 @@ func (r *StatsRepository) IncrementFans(ctx context.Context, authorID uint, delt
 // 供关注关系的事务化写入复用，保证 socials 与 creator_stats 同时生效。
 func upsertFans(tx *gorm.DB, authorID uint, delta int64) error {
 	if err := tx.Exec(
-		`INSERT INTO creator_stats (author_id, fans_count, is_big)
-		 VALUES (?, GREATEST(?, 0), ?)
+		`INSERT INTO creator_stats (author_id, fans_count, is_big, was_big)
+		 VALUES (?, GREATEST(?, 0), ?, 0)
 		 ON DUPLICATE KEY UPDATE fans_count = GREATEST(fans_count + ?, 0)`,
 		authorID, delta, delta >= domainsocial.BigVFansThreshold, delta,
 	).Error; err != nil {
 		return err
 	}
+	// 双阈值滞回：>= 10 万进入大 V，< 9 万才退出。
+	// was_big 记录“曾经是大 V 且已跌破退出阈值”，读路径据此继续拉 Outbox，避免历史断层。
 	return tx.Exec(
 		`UPDATE creator_stats
-		 SET is_big = (fans_count >= ?)
+		 SET was_big = CASE
+		         WHEN is_big = 1 AND fans_count < ? THEN 1
+		         ELSE was_big
+		     END,
+		     is_big = CASE
+		         WHEN fans_count >= ? THEN 1
+		         WHEN fans_count < ? THEN 0
+		         ELSE is_big
+		     END
 		 WHERE author_id = ?`,
-		domainsocial.BigVFansThreshold, authorID,
+		domainsocial.BigVExitThreshold,
+		domainsocial.BigVFansThreshold,
+		domainsocial.BigVExitThreshold,
+		authorID,
 	).Error
 }
 
@@ -83,12 +97,14 @@ func (r *StatsRepository) ListFollowing(ctx context.Context, followerID uint) ([
 		AuthorID        uint         `gorm:"column:author_id"`
 		FansCount       int64        `gorm:"column:fans_count"`
 		IsBig           bool         `gorm:"column:is_big"`
+		WasBig          bool         `gorm:"column:was_big"`
 		LastPublishTime sql.NullTime `gorm:"column:last_publish_time"`
 	}
 	if err := r.db.WithContext(ctx).Raw(
 		`SELECT s.vlogger_id AS author_id,
 		        COALESCE(cs.fans_count, 0) AS fans_count,
 		        COALESCE(cs.is_big, 0) AS is_big,
+		        COALESCE(cs.was_big, 0) AS was_big,
 		        cs.last_publish_time
 		 FROM socials s
 		 LEFT JOIN creator_stats cs ON cs.author_id = s.vlogger_id
@@ -104,6 +120,7 @@ func (r *StatsRepository) ListFollowing(ctx context.Context, followerID uint) ([
 			AuthorID:  row.AuthorID,
 			FansCount: row.FansCount,
 			IsBig:     row.IsBig,
+			WasBig:    row.WasBig,
 		}
 		if row.LastPublishTime.Valid {
 			item.LastPublishTime = row.LastPublishTime.Time

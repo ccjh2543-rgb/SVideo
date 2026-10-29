@@ -4,6 +4,7 @@ package redis
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 const (
 	// Inbox 与 Outbox 是热缓存而不是全量存储：
 	// 超过容量的历史内容由数据库游标查询兜底，不能再从 Outbox 反查。
-	inboxMaxSize  int64 = 300
+	inboxMaxSize  int64 = domainfeed.DefaultInboxCapacity
 	outboxMaxSize int64 = 50
 	timelineTTL         = 7 * 24 * time.Hour
 )
@@ -54,6 +55,137 @@ func (r *TimelineRepository) PushInboxBatch(ctx context.Context, followerIDs []u
 		entries[key] = []goredis.Z{{Score: float64(score), Member: member}}
 	}
 	return r.cache.ZAddManyWithTrim(ctx, entries, 0, -inboxMaxSize-1, timelineTTL)
+}
+
+// PushInboxEntries 批量向粉丝收件箱写入带各自分数的条目，并裁剪到固定长度。
+// 用于新关注时把作者最近的视频回填到粉丝 Inbox，保证首次刷新就能看到内容。
+func (r *TimelineRepository) PushInboxEntries(ctx context.Context, followerID uint, entries []domainfeed.TimelineEntry) error {
+	if followerID == 0 || len(entries) == 0 {
+		return nil
+	}
+	values := make([]goredis.Z, 0, len(entries))
+	for _, entry := range entries {
+		if entry.VideoID == 0 {
+			continue
+		}
+		values = append(values, goredis.Z{
+			Score:  float64(entry.Score),
+			Member: timelineMember(entry.VideoID),
+		})
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return r.cache.ZAddManyWithTrim(ctx, map[string][]goredis.Z{
+		inboxKey(followerID): values,
+	}, 0, -inboxMaxSize-1, timelineTTL)
+}
+
+// PushInboxEntriesWindow 只写入能进入 Inbox 容量窗口的条目。
+//
+// Inbox 未满时按剩余容量取最新条目；
+// Inbox 已满时只写比当前最老条目更新的条目，避免回填的数据立刻被裁剪。
+func (r *TimelineRepository) PushInboxEntriesWindow(
+	ctx context.Context,
+	followerID uint,
+	entries []domainfeed.TimelineEntry,
+	capacity int64,
+) error {
+	if followerID == 0 || len(entries) == 0 {
+		return nil
+	}
+	if capacity <= 0 {
+		capacity = inboxMaxSize
+	}
+
+	key := inboxKey(followerID)
+	card, err := r.cache.ZCard(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	var oldestScore int64
+	var oldestID uint
+	if card >= capacity {
+		oldest, err := r.cache.ZRangeWithScores(ctx, key, 0, 0)
+		if err != nil {
+			return err
+		}
+		parsed := toEntries(oldest)
+		if len(parsed) > 0 {
+			oldestScore = parsed[0].Score
+			oldestID = parsed[0].VideoID
+		}
+	}
+
+	selected := selectInboxWindowEntries(entries, card, capacity, oldestScore, oldestID)
+	if len(selected) == 0 {
+		return nil
+	}
+
+	values := make([]goredis.Z, 0, len(selected))
+	for _, entry := range selected {
+		if entry.VideoID == 0 {
+			continue
+		}
+		values = append(values, goredis.Z{
+			Score:  float64(entry.Score),
+			Member: timelineMember(entry.VideoID),
+		})
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return r.cache.ZAddManyWithTrim(ctx, map[string][]goredis.Z{
+		key: values,
+	}, 0, -inboxMaxSize-1, timelineTTL)
+}
+
+// selectInboxWindowEntries 计算哪些条目值得写入 Inbox。
+// 条目按 (score, videoID) 倒序排序；Inbox 未满时取最新剩余容量条，
+// 已满时只保留严格大于最老条目的记录。
+func selectInboxWindowEntries(
+	entries []domainfeed.TimelineEntry,
+	card int64,
+	capacity int64,
+	oldestScore int64,
+	oldestID uint,
+) []domainfeed.TimelineEntry {
+	if len(entries) == 0 || capacity <= 0 {
+		return nil
+	}
+	sorted := make([]domainfeed.TimelineEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.VideoID != 0 {
+			sorted = append(sorted, entry)
+		}
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Score == sorted[j].Score {
+			return sorted[i].VideoID > sorted[j].VideoID
+		}
+		return sorted[i].Score > sorted[j].Score
+	})
+
+	if card < capacity {
+		limit := capacity - card
+		if int64(len(sorted)) > limit {
+			sorted = sorted[:limit]
+		}
+		return sorted
+	}
+
+	// Inbox 已满：只有分数更高，或同分但 videoID 更大的条目才能留下。
+	if oldestScore == 0 && oldestID == 0 {
+		return nil
+	}
+	result := make([]domainfeed.TimelineEntry, 0, len(sorted))
+	for _, entry := range sorted {
+		if entry.Score > oldestScore || (entry.Score == oldestScore && entry.VideoID > oldestID) {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 // PushOutbox 向作者发件箱写入视频，并裁剪到固定长度。

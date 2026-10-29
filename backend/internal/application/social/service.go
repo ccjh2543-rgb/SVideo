@@ -3,6 +3,7 @@ package social
 
 import (
 	"context"
+	"log"
 
 	domainsocial "feedsystem_video_go/internal/domain/social"
 )
@@ -25,26 +26,38 @@ type FollowingCacheInvalidator interface {
 	Invalidate(ctx context.Context, followerID uint) error
 }
 
+// HeavyRegistry 重度用户索引维护端口。
+type HeavyRegistry interface {
+	OnFollowBigV(ctx context.Context, uid, bigV uint) (becameHeavy bool, isHeavy bool, err error)
+	OnUnfollowBigV(ctx context.Context, uid, bigV uint) error
+}
+
 // SocialService 社交应用服务。
 type SocialService struct {
 	repo           domainsocial.Repository
 	accounts       AccountExister
+	stats          domainsocial.StatsRepository
 	events         EventPublisher
 	followingCache FollowingCacheInvalidator
+	heavy          HeavyRegistry
 }
 
 // NewSocialService 创建社交应用服务。
 func NewSocialService(
 	repo domainsocial.Repository,
 	accounts AccountExister,
+	stats domainsocial.StatsRepository,
 	events EventPublisher,
 	followingCache FollowingCacheInvalidator,
+	heavy HeavyRegistry,
 ) *SocialService {
 	return &SocialService{
 		repo:           repo,
 		accounts:       accounts,
+		stats:          stats,
 		events:         events,
 		followingCache: followingCache,
+		heavy:          heavy,
 	}
 }
 
@@ -93,6 +106,7 @@ func (s *SocialService) Follow(ctx context.Context, relation *domainsocial.Socia
 	if err := s.repo.FollowWithStats(ctx, relation); err != nil {
 		return err
 	}
+	s.updateHeavyOnFollow(ctx, relation.FollowerID, relation.VloggerID)
 	s.invalidateFollowing(ctx, relation.FollowerID)
 	return nil
 }
@@ -123,8 +137,37 @@ func (s *SocialService) Unfollow(ctx context.Context, relation *domainsocial.Soc
 	if err := s.repo.UnfollowWithStats(ctx, relation); err != nil {
 		return err
 	}
+	s.updateHeavyOnUnfollow(ctx, relation.FollowerID, relation.VloggerID)
 	s.invalidateFollowing(ctx, relation.FollowerID)
 	return nil
+}
+
+// updateHeavyOnFollow 在 MQ 不可用、同步落库时维护重度用户索引。
+func (s *SocialService) updateHeavyOnFollow(ctx context.Context, followerID, vloggerID uint) {
+	if s.heavy == nil || s.stats == nil {
+		return
+	}
+	stats, err := s.stats.Get(ctx, vloggerID)
+	if err != nil {
+		log.Printf("social service: heavy stats failed vlogger=%d: %v", vloggerID, err)
+		return
+	}
+	if stats == nil || (!stats.IsBig && stats.FansCount < domainsocial.BigVFansThreshold) {
+		return
+	}
+	if _, _, err := s.heavy.OnFollowBigV(ctx, followerID, vloggerID); err != nil {
+		log.Printf("social service: heavy follow failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
+	}
+}
+
+// updateHeavyOnUnfollow 在 MQ 不可用、同步落库时维护重度用户索引。
+func (s *SocialService) updateHeavyOnUnfollow(ctx context.Context, followerID, vloggerID uint) {
+	if s.heavy == nil {
+		return
+	}
+	if err := s.heavy.OnUnfollowBigV(ctx, followerID, vloggerID); err != nil {
+		log.Printf("social service: heavy unfollow failed follower=%d vlogger=%d: %v", followerID, vloggerID, err)
+	}
 }
 
 // invalidateFollowing 清理关注列表缓存。

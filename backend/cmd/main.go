@@ -190,11 +190,12 @@ func main() {
 	socialRepository := socialmysql.NewRepository(sqlDB)
 	creatorStatsRepository := socialmysql.NewStatsRepository(sqlDB)
 	followingCache := feedcache.NewFollowingCache(cache)
+	heavyRegistry := feedcache.NewHeavyRegistry(cache)
 	var socialPublisher appsocial.EventPublisher
 	if socialMQ != nil {
 		socialPublisher = socialMQ
 	}
-	socialService := appsocial.NewSocialService(socialRepository, accountRepository, socialPublisher, followingCache)
+	socialService := appsocial.NewSocialService(socialRepository, accountRepository, creatorStatsRepository, socialPublisher, followingCache, heavyRegistry)
 	socialHandler := httpsocial.NewSocialHandler(socialService)
 
 	// ============================================================
@@ -211,6 +212,7 @@ func main() {
 		rediscache.NewTimelineRepository(cache),
 		creatorStatsRepository,
 		followingCache,
+		heavyRegistry,
 		guard,
 	)
 	feedHandler := httpfeed.NewFeedHandler(feedService)

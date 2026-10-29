@@ -5,9 +5,19 @@ import (
 	"time"
 )
 
-// BigVFansThreshold 大 V 判定阈值。
-// 超过该粉丝数的作者发布视频时不做写扩散，由粉丝读时拉取。
+// BigVFansThreshold 大 V 进入阈值。
+// 粉丝数达到该值的作者发布视频时不做全量写扩散，由粉丝读时拉取。
 const BigVFansThreshold int64 = 100000
+
+// BigVExitThreshold 大 V 退出阈值。
+// 采用滞回：粉丝数跌破该值才从小 V 状态退出，避免在 10 万附近抖动。
+const BigVExitThreshold int64 = 90000
+
+// HeavyEnterThreshold 关注大 V 数达到该值时进入重度用户。
+const HeavyEnterThreshold int64 = 100
+
+// HeavyExitThreshold 关注大 V 数低于该值时退出重度用户，避免阈值抖动。
+const HeavyExitThreshold int64 = 80
 
 // Repository 关注关系仓储接口。
 type Repository interface {
@@ -33,9 +43,12 @@ type Repository interface {
 
 // Stats 创作者统计信息。
 type Stats struct {
-	AuthorID        uint
-	FansCount       int64
-	IsBig           bool
+	AuthorID  uint
+	FansCount int64
+	IsBig     bool
+	// WasBig 表示作者曾经是大 V 且已经跌破退出阈值。
+	// 读路径仍会拉取它的 Outbox，避免大 V 变小 V 的历史内容断层。
+	WasBig          bool
 	LastPublishTime time.Time
 }
 

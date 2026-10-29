@@ -10,17 +10,18 @@ import (
 	domainvideo "feedsystem_video_go/internal/domain/video"
 )
 
-func TestLinearDecayWeights(t *testing.T) {
-	weights := linearDecayWeights(24)
+func TestExponentialDecayWeights(t *testing.T) {
+	asOf := time.Date(2026, 10, 19, 15, 0, 0, 0, time.UTC)
+	weights := ExponentialDecayWeights(asOf, 24, domainfeed.DefaultHotHalfLife)
 	if len(weights) != 24 {
 		t.Fatalf("expected 24 weights, got %d", len(weights))
 	}
 	if weights[0] != 1 {
 		t.Fatalf("expected newest weight 1, got %f", weights[0])
 	}
-	expectedOldest := 1.0 / 24.0
-	if diff := weights[23] - expectedOldest; diff > 1e-9 || diff < -1e-9 {
-		t.Fatalf("expected oldest weight %f, got %f", expectedOldest, weights[23])
+	// 半衰期 6 小时，6 小时后的权重应为 1/2。
+	if diff := weights[6] - 0.5; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("expected 6-hour weight 0.5, got %f", weights[6])
 	}
 	for i := 1; i < len(weights); i++ {
 		if weights[i] > weights[i-1] {
@@ -31,14 +32,14 @@ func TestLinearDecayWeights(t *testing.T) {
 
 func TestHotWindowKeys(t *testing.T) {
 	asOf := time.Date(2026, 10, 19, 15, 0, 0, 0, time.UTC)
-	keys := hotWindowKeys(asOf, 24)
+	keys := HotWindowKeys(asOf, 24)
 	if len(keys) != 24 {
 		t.Fatalf("expected 24 keys, got %d", len(keys))
 	}
-	if keys[0] != "hot:video:1h:2026101915" {
+	if keys[0] != "hot:top:1h:2026101915" {
 		t.Fatalf("unexpected newest key: %s", keys[0])
 	}
-	if keys[23] != "hot:video:1h:2026101816" {
+	if keys[23] != "hot:top:1h:2026101816" {
 		t.Fatalf("unexpected oldest key: %s", keys[23])
 	}
 }
@@ -135,6 +136,84 @@ func TestFilterVideosByAuthors(t *testing.T) {
 	}
 	if got[0].ID != 1 || got[1].ID != 3 {
 		t.Fatalf("unexpected videos: %+v", got)
+	}
+}
+
+func TestAssembleFollowingPage(t *testing.T) {
+	buildVideos := func(n int) []*domainvideo.Video {
+		videos := make([]*domainvideo.Video, 0, n)
+		for i := 0; i < n; i++ {
+			videos = append(videos, &domainvideo.Video{ID: uint(i + 1)})
+		}
+		return videos
+	}
+
+	tests := []struct {
+		name           string
+		videoCount     int
+		consumed       int
+		candidateCount int
+		limit          int
+		wantLen        int
+		wantHasMore    bool
+	}{
+		{
+			name:           "候选刚好一页",
+			videoCount:     10,
+			consumed:       10,
+			candidateCount: 10,
+			limit:          10,
+			wantLen:        10,
+			wantHasMore:    false,
+		},
+		{
+			name:           "跳过已删除视频后凑满一页",
+			videoCount:     10,
+			consumed:       12,
+			candidateCount: 12,
+			limit:          10,
+			wantLen:        10,
+			wantHasMore:    false,
+		},
+		{
+			name:           "候选超过一页只返回 limit 条",
+			videoCount:     15,
+			consumed:       10,
+			candidateCount: 15,
+			limit:          10,
+			wantLen:        10,
+			wantHasMore:    true,
+		},
+		{
+			name:           "候选不足一页",
+			videoCount:     3,
+			consumed:       3,
+			candidateCount: 3,
+			limit:          10,
+			wantLen:        3,
+			wantHasMore:    false,
+		},
+		{
+			name:           "候选取完仍不足一页交给 DB 补页",
+			videoCount:     8,
+			consumed:       12,
+			candidateCount: 12,
+			limit:          10,
+			wantLen:        8,
+			wantHasMore:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			videos, hasMore := assembleFollowingPage(buildVideos(tt.videoCount), tt.consumed, tt.candidateCount, tt.limit)
+			if len(videos) != tt.wantLen {
+				t.Fatalf("expected %d videos, got %d", tt.wantLen, len(videos))
+			}
+			if hasMore != tt.wantHasMore {
+				t.Fatalf("expected hasMore=%v, got %v", tt.wantHasMore, hasMore)
+			}
+		})
 	}
 }
 

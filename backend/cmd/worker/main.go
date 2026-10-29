@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	feedapp "feedsystem_video_go/internal/application/feed"
+	appvideo "feedsystem_video_go/internal/application/video"
 	"feedsystem_video_go/internal/config"
 	"feedsystem_video_go/internal/db"
 	domainfeed "feedsystem_video_go/internal/domain/feed"
@@ -173,6 +174,11 @@ func main() {
 	notifier := ws.NewRedisNotifier(cache, nil)
 	followingCache := feedcache.NewFollowingCache(cache)
 
+	var heavyRegistry *feedcache.HeavyRegistry
+	if cache != nil {
+		heavyRegistry = feedcache.NewHeavyRegistry(cache)
+	}
+
 	var socialTimeline domainfeed.TimelineRepository
 	if cache != nil {
 		socialTimeline = rediscache.NewTimelineRepository(cache)
@@ -187,6 +193,8 @@ func main() {
 			0,
 			500,
 		)
+		// 大 V 发布时只向重度粉丝选择性推，避免全量粉丝写扩散。
+		fanoutService.SetHeavyPush(feedapp.NewHeavyPushService(heavyRegistry, socialTimeline, 500))
 	}
 
 	// 热榜快照由后台任务预生成，请求路径只读快照。
@@ -194,6 +202,15 @@ func main() {
 	if cache != nil {
 		hotSnapshotBuilder = feedworkers.NewHotSnapshotBuilder(feedcache.NewRankingCache(cache))
 	}
+
+	// 计数对账任务只依赖 MySQL，定期按明细修正 likes_count / fans_count。
+	counterReconciler := videoworkers.NewCounterReconciler(
+		appvideo.NewCounterReconcileService(
+			videomysql.NewReconcileRepository(sqlDB),
+			socialmysql.NewReconcileRepository(sqlDB),
+		),
+		0,
+	)
 
 	// ============================================================
 	// 6. 创建具体的 Worker（消费者）
@@ -209,7 +226,7 @@ func main() {
 	// 只有当 RabbitMQ 通道（ch）不为 nil 时，才创建工作线程
 	// 队列名称（如 socialQueue）应当是在其他地方定义的常量，代表需要监听的队列名
 	if ch != nil {
-		socialWorker = socialworkers.NewSocialWorker(ch, repo, socialTimeline, followingCache, processedEvents, notifier, socialQueue)
+		socialWorker = socialworkers.NewSocialWorker(ch, repo, creatorRepo, socialTimeline, followingCache, heavyRegistry, processedEvents, notifier, socialQueue)
 		likeWorker = videoworkers.NewLikeWorker(ch, likeRepo, videoRepo, processedEvents, notifier, likeQueue)
 		commentWorker = videoworkers.NewCommentWorker(ch, commentRepo, videoRepo, processedEvents, notifier, commentQueue)
 
@@ -265,6 +282,13 @@ func main() {
 			}
 		}()
 	}
+
+	// 计数对账任务：与主业务 Worker 独立运行，修复计数漂移。
+	go func() {
+		if err := counterReconciler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("Counter reconciler stopped: %v", err)
+		}
+	}()
 
 	// 启动 pprof 性能分析 HTTP 服务（用于调试）
 	pprofServer, err := observability.NewPprofServer(

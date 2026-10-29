@@ -50,14 +50,15 @@ func (CommentModel) TableName() string { return "comments" }
 
 // OutboxModel 事务消息表 GORM 模型。
 type OutboxModel struct {
-	ID         uint       `gorm:"primaryKey"`
-	VideoID    uint       `gorm:"index"`
-	AuthorID   uint       `gorm:"index"`
-	EventType  string     `gorm:"type:varchar(50)"`
-	CreateTime time.Time  `gorm:"autoCreateTime"`
-	Status     string     `gorm:"type:varchar(50);index"`
+	ID        uint   `gorm:"primaryKey"`
+	VideoID   uint   `gorm:"index"`
+	AuthorID  uint   `gorm:"index"`
+	EventType string `gorm:"type:varchar(50)"`
+	// 复合索引覆盖 poller / 补偿任务的共同过滤条件：status + next_retry + create_time。
+	CreateTime time.Time  `gorm:"autoCreateTime;index:idx_outbox_status_retry_time,priority:3"`
+	Status     string     `gorm:"type:varchar(50);index:idx_outbox_status_retry_time,priority:1"`
 	RetryCount int        `gorm:"not null;default:0"`
-	NextRetry  *time.Time `gorm:"index"`
+	NextRetry  *time.Time `gorm:"index:idx_outbox_status_retry_time,priority:2"`
 }
 
 // TableName 指定事务消息表名。

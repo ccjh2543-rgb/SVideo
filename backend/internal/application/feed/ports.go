@@ -45,6 +45,22 @@ type FollowingCache interface {
 	Set(ctx context.Context, followerID uint, stats []*domainsocial.Stats)
 }
 
+// HeavyUserCache 重度用户标记端口。
+// 重度用户的大 V 内容已经通过选择性推进入 Inbox，读路径可以跳过已登记的大 V Outbox。
+type HeavyUserCache interface {
+	IsHeavy(ctx context.Context, uid uint) (bool, error)
+	// ListHeavyFollowing 返回已登记到反向索引的大 V，用于读路径过滤。
+	ListHeavyFollowing(ctx context.Context, uid uint) ([]uint, error)
+	// EnsureHeavy 根据当前关注的大 V 列表懒重建重度索引。
+	EnsureHeavy(ctx context.Context, uid uint, bigVIDs []uint) (bool, error)
+	// IsBackfilled 判断重度用户的大 V 历史内容是否已经回填完成。
+	IsBackfilled(ctx context.Context, uid uint) (bool, error)
+	// TryBeginBackfill 抢占一次回填任务，避免并发重复回填。
+	TryBeginBackfill(ctx context.Context, uid uint) (bool, error)
+	// MarkBackfilled 标记回填完成。
+	MarkBackfilled(ctx context.Context, uid uint) error
+}
+
 // DependencyGuard 依赖熔断端口。
 // 应用层只表达“该依赖当前是否允许调用”，具体熔断算法位于 infrastructure/resilience。
 type DependencyGuard interface {

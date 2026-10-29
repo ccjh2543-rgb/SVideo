@@ -18,6 +18,7 @@ type StatsModel struct {
 	AuthorID        uint       `gorm:"primaryKey;autoIncrement:false"`
 	FansCount       int64      `gorm:"not null;default:0"`
 	IsBig           bool       `gorm:"not null;default:false"`
+	WasBig          bool       `gorm:"not null;default:false"`
 	LastPublishTime *time.Time `gorm:"index"`
 }
 

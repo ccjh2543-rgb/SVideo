@@ -75,6 +75,16 @@ func (f *fakeTimelineRepository) PushInboxBatch(_ context.Context, followerIDs [
 	return nil
 }
 
+func (f *fakeTimelineRepository) PushInboxEntries(_ context.Context, followerID uint, entries []domainfeed.TimelineEntry) error {
+	f.inbox[followerID] = append(f.inbox[followerID], entries...)
+	return nil
+}
+
+func (f *fakeTimelineRepository) PushInboxEntriesWindow(_ context.Context, followerID uint, entries []domainfeed.TimelineEntry, _ int64) error {
+	f.inbox[followerID] = append(f.inbox[followerID], entries...)
+	return nil
+}
+
 func (f *fakeTimelineRepository) PushOutbox(_ context.Context, authorID uint, videoID uint, score int64) error {
 	f.outbox[authorID] = append(f.outbox[authorID], domainfeed.TimelineEntry{VideoID: videoID, Score: score})
 	return nil
@@ -168,5 +178,52 @@ func TestFanoutBigCreatorOnlyWritesOutbox(t *testing.T) {
 	}
 	if len(timeline.inbox) != 0 {
 		t.Fatalf("big creator should not write inbox, got %+v", timeline.inbox)
+	}
+}
+
+type fakeHeavyFollowerReader struct {
+	ids []uint
+}
+
+func (f *fakeHeavyFollowerReader) ScanHeavyFollowers(_ context.Context, _ uint, cursor uint64, count int64) ([]uint, uint64, error) {
+	start := int(cursor)
+	if start >= len(f.ids) {
+		return nil, 0, nil
+	}
+	end := start + int(count)
+	if end > len(f.ids) {
+		end = len(f.ids)
+	}
+	next := uint64(end)
+	if end >= len(f.ids) {
+		next = 0
+	}
+	return f.ids[start:end], next, nil
+}
+
+func TestFanoutBigCreatorPushesHeavyFollowers(t *testing.T) {
+	timeline := newFakeTimelineRepository()
+	service := NewFanoutService(
+		&fakeCreatorRepository{stats: &domainsocial.Stats{AuthorID: 1, FansCount: 100001, IsBig: true}},
+		&fakeFollowerReader{ids: []uint{2, 3, 4}},
+		timeline,
+		100000,
+		2,
+	)
+	service.SetHeavyPush(NewHeavyPushService(&fakeHeavyFollowerReader{ids: []uint{2, 3}}, timeline, 1))
+
+	if err := service.Handle(context.Background(), 9, 1, time.Now()); err != nil {
+		t.Fatalf("fanout: %v", err)
+	}
+	if len(timeline.outbox[1]) != 1 {
+		t.Fatalf("expected outbox entry, got %+v", timeline.outbox[1])
+	}
+	for _, followerID := range []uint{2, 3} {
+		if len(timeline.inbox[followerID]) != 1 || timeline.inbox[followerID][0].VideoID != 9 {
+			t.Fatalf("expected heavy inbox entry for follower %d, got %+v", followerID, timeline.inbox[followerID])
+		}
+	}
+	if len(timeline.inbox[4]) != 0 {
+		t.Fatalf("normal follower should not receive heavy push, got %+v", timeline.inbox[4])
 	}
 }

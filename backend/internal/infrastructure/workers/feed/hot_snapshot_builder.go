@@ -6,19 +6,25 @@ import (
 	"log"
 	"time"
 
-	feedapp "feedsystem_video_go/internal/application/feed"
+	domainfeed "feedsystem_video_go/internal/domain/feed"
 	feedcache "feedsystem_video_go/internal/infrastructure/cache/redis/feed"
 )
 
 const (
 	// hotSnapshotInterval 快照刷新间隔，需小于快照 TTL。
 	hotSnapshotInterval = time.Minute
-	// hotSnapshotBudget 单次合并的时间预算。
+	// hotSnapshotBudget 单次候选合并与快照构建的时间预算。
 	hotSnapshotBudget = 5 * time.Second
 	// hotSnapshotHours 预生成的 as_of 个数：当前小时与上一小时。
 	hotSnapshotHours = 2
 	// hotSnapshotWindowHours 热榜窗口长度。
-	hotSnapshotWindowHours = 24
+	hotSnapshotWindowHours = domainfeed.HotWindowHours
+	// hotShardCount 候选桶分片数。
+	hotShardCount = domainfeed.HotShardCount
+	// hotBucketTopN 每个小时 Top 桶保留数量。
+	hotBucketTopN = domainfeed.HotBucketTopN
+	// hotHalfLife 热度指数衰减半衰期。
+	hotHalfLife = domainfeed.DefaultHotHalfLife
 )
 
 // HotSnapshotBuilder 离线预生成热榜快照。
@@ -52,17 +58,22 @@ func (b *HotSnapshotBuilder) Run(ctx context.Context) error {
 	}
 }
 
-// build 构建当前小时与上一小时的快照。
+// build 构建当前小时与上一小时的 Top 桶和合并快照。
 func (b *HotSnapshotBuilder) build(ctx context.Context) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	for i := 0; i < b.hours; i++ {
 		asOf := now.Add(-time.Duration(i) * time.Hour)
-		dest := "hot:video:merge:1h:" + asOf.Format("2006010215")
-		keys := feedapp.HotWindowKeys(asOf, hotSnapshotWindowHours)
-		weights := feedapp.LinearDecayWeights(hotSnapshotWindowHours)
-
 		buildCtx, cancel := context.WithTimeout(ctx, hotSnapshotBudget)
-		err := b.ranking.EnsureSnapshot(buildCtx, dest, keys, weights)
+
+		// 候选桶只累计，Top 桶负责裁剪；先合并候选，再构建 24 小时快照。
+		if err := b.ranking.PromoteCandidates(buildCtx, asOf, hotShardCount, hotBucketTopN); err != nil {
+			log.Printf("hot snapshot builder: promote %s failed: %v", asOf.Format("2006010215"), err)
+		}
+
+		dest := domainfeed.HotSnapshotKey(asOf)
+		keys := domainfeed.HotTopWindowKeys(asOf, hotSnapshotWindowHours)
+		weights := domainfeed.HotDecayWeights(asOf, hotSnapshotWindowHours, hotHalfLife)
+		err := b.ranking.RefreshSnapshot(buildCtx, dest, keys, weights)
 		cancel()
 		if err != nil {
 			log.Printf("hot snapshot builder: build %s failed: %v", dest, err)
